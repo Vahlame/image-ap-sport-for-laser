@@ -56,3 +56,8 @@ Registro de auditoria y auto-mejora del pipeline (branch `feat/auto-improve-pipe
 - Carpeta sin `.git` en este entorno: inicializar repo, rama `feat/auto-improve-pipeline`, commits incrementales y `git push` cuando exista `origin`.
 - Corridas largas de smoke (`--n` 100 v2 + register) no re-ejecutadas aqui por tiempo; validar localmente con referencias reales.
 - `PlateauDetector` sin accion `ABORT` (solo `RESTART` / `NONE`); ampliar si hace falta criterio de aborto global.
+
+### Ajuste Sobol + git meta
+
+- `dense_blue_family_candidates`: muestra Sobol con `n` potencia de 2 y recorte para evitar `UserWarning` de scipy.
+- `.gitignore`: `runs/_meta/*.sqlite` para no versionar bases locales generadas por corridas.
