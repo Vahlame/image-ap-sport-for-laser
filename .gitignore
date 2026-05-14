@@ -18,6 +18,8 @@ runs/*
 
 # Meta DB may live under runs/_meta per project convention
 !runs/_meta/
+runs/_meta/*.sqlite
+runs/_meta/*.sqlite-journal
 
 # Copias locales en la raiz del repo (canonicas bajo runs/references/ si aplica)
 /foto objetivo sin procesar.jpeg
