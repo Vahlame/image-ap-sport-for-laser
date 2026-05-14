@@ -53,8 +53,8 @@ Registro de auditoria y auto-mejora del pipeline (branch `feat/auto-improve-pipe
 
 ### Pendientes
 
-- Carpeta sin `.git` en este entorno: inicializar repo, rama `feat/auto-improve-pipeline`, commits incrementales y `git push` cuando exista `origin`.
-- Corridas largas de smoke (`--n` 100 v2 + register) no re-ejecutadas aqui por tiempo; validar localmente con referencias reales.
+- Configurar `git remote add origin ...` y `git push -u origin feat/auto-improve-pipeline` cuando corresponda (aqui no hay remoto).
+- Corridas largas de smoke (`--n` 100+ v2 + `--register affine`) opcionales para validar metricas visuales end-to-end.
 - `PlateauDetector` sin accion `ABORT` (solo `RESTART` / `NONE`); ampliar si hace falta criterio de aborto global.
 
 ### Ajuste Sobol + git meta
