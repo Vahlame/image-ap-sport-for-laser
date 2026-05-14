@@ -1,0 +1,37 @@
+[project]
+name = "image-ap-sport-for-laser"
+version = "0.1.0"
+description = "Laser-ready image prep (PNG) — dev tooling"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "Pillow>=10.0.0",
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+    "scikit-image>=0.22.0",
+    "opencv-python-headless>=4.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+fast = [
+    "numba>=0.59.0",
+]
+meta = [
+    "optuna>=3.6.0",
+]
+dashboard = [
+    "streamlit>=1.32.0",
+]
+perceptual = [
+    "piq>=0.8.0",
+    "lpips>=0.1.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: tests that download public stock images (needs internet)",
+]

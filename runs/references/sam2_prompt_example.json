@@ -1,0 +1,6 @@
+{
+  "comment": "Coordenadas en pixeles de la imagen de entrada al matcher (misma resolucion que --input tras resize al target). Ajustar caja o puntos a tu foto.",
+  "input_boxes": [[[32, 48, 520, 720]]],
+  "multimask_output": false,
+  "mask_index": 0
+}
