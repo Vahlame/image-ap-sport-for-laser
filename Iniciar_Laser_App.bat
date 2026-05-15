@@ -49,15 +49,17 @@ if not exist "%ROOT%.venv312\Scripts\python.exe" (
 if not exist "%ROOT%web\build\index.html" (
     echo [AVISO] No existe web\build\index.html.
     echo  Intentando construir el wizard estatico ahora...
-    if not exist "%ROOT%web\node_modules\" (
-        echo [ERROR] Falta web\node_modules. Ejecuta Setup_LaserApp.bat.
+    if not exist "%ROOT%web\node_modules\.bin\vite.cmd" (
+        echo [ERROR] Falta vite en web\node_modules. Ejecuta Setup_LaserApp.bat
+        echo  para instalar/reparar las dependencias.
         pause
         exit /b 1
     )
     pushd "%ROOT%web"
-    call npm run build
+    REM Llamar al shim directo evita el problema de PATH dentro de Program Files.
+    call "node_modules\.bin\vite.cmd" build
     if errorlevel 1 (
-        echo [ERROR] npm run build fallo. Revisa la consola arriba.
+        echo [ERROR] vite build fallo. Revisa la consola arriba.
         popd
         pause
         exit /b 1

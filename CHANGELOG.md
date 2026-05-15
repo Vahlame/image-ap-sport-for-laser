@@ -4,6 +4,20 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [1.3.2] — 2026-05-15
+
+### Fix
+- **`Setup_LaserApp.bat`** y **`Iniciar_Laser_App.bat`** ahora invocan directamente
+  el shim `node_modules\.bin\vite.cmd` con ruta absoluta, en vez de `npm run build`.
+  Esto soluciona el error `vite no se reconoce` que aparecía al ejecutar el setup
+  dentro de `C:\Program Files\ImageAPLaser\` (PATH del shell de Inno Setup no
+  resolvía bien los binarios locales de npm).
+- Si `node_modules\.bin\vite.cmd` no existe, Setup reinstala las dependencias
+  con `npm ci` (o `npm install` como fallback). Cubre el caso de `node_modules`
+  presente pero corrupto/incompleto.
+- npm install ahora usa `--no-audit --no-fund` para evitar warnings irrelevantes
+  durante la primera instalación.
+
 ## [1.3.1] — 2026-05-15
 
 ### Fix

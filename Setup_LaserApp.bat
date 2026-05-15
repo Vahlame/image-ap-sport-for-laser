@@ -105,20 +105,38 @@ REM ---------------------------------------------------------------------------
 echo.
 echo [4/5] Construyendo wizard web (SvelteKit estatico)...
 pushd web
-if not exist "node_modules" (
-    echo   Instalando dependencias npm...
-    call npm install
+
+REM node_modules puede estar (a) ausente, (b) presente pero incompleto. Si falta vite,
+REM reinstalamos las dependencias (npm ci). Esto cubre el caso de install previo roto.
+if not exist "node_modules\.bin\vite.cmd" (
+    if exist "node_modules" (
+        echo   node_modules incompleto ^(falta vite^). Reinstalando dependencias npm...
+    ) else (
+        echo   node_modules ausente. Instalando dependencias npm...
+    )
+    if exist "package-lock.json" (
+        call npm ci --no-audit --no-fund
+    ) else (
+        call npm install --no-audit --no-fund
+    )
     if errorlevel 1 (
-        echo   [ERROR] npm install fallo.
+        echo   [ERROR] npm install/ci fallo. Revisa la consola arriba.
         popd
         pause
         exit /b 1
     )
 )
-echo   Building estatico (npm run build)...
-call npm run build
+
+REM Usar la ruta absoluta al shim de vite para evitar problemas de PATH dentro de
+REM Program Files. Si falla, fallback a npx (que tambien resuelve binarios locales).
+echo   Building estatico (vite build)...
+if exist "node_modules\.bin\vite.cmd" (
+    call "node_modules\.bin\vite.cmd" build
+) else (
+    call npx --no-install vite build
+)
 if errorlevel 1 (
-    echo   [ERROR] npm run build fallo.
+    echo   [ERROR] vite build fallo. Revisa la consola arriba.
     popd
     pause
     exit /b 1
