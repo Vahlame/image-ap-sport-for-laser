@@ -4,6 +4,18 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [1.3.1] — 2026-05-15
+
+### Fix
+- **Launcher `Iniciar_Laser_App.bat`** ya no intenta arrancar Vite dev server.
+  El wizard se sirve desde el FastAPI estático (`/app/`) como en v1.2+. Esto
+  elimina el error `vite no se reconoce` que aparecía tras instalar via .exe
+  (problema de PATH de `npm run dev` en `cmd` shells dentro del install dir).
+- Si `web/build/index.html` no existe al arrancar, el launcher hace `npm run build`
+  automáticamente. La ventana `Laser Web` (Vite) ya no se abre.
+- Para hot-reload de UI (dev): `cd web && npm run dev` manualmente. El launcher
+  oficial va por la ruta estática.
+
 ## [1.3.0] — 2026-05-15
 
 ### Agregado — flujo Express
