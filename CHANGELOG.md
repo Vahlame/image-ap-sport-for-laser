@@ -4,6 +4,43 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [1.3.0] — 2026-05-15
+
+### Agregado — flujo Express
+- **Modo Express en el wizard**: subís una foto y la app la procesa automáticamente
+  con tu configuración guardada (material + mm + DPI) + auto-detección de preset +
+  HQ refinement. Cero sliders. Una foto, un resultado.
+- **`Mi configuración` persistente en localStorage** (`MyConfig`): material por
+  defecto, output mm corto, DPI, sharpen radius. Se aplica en Express y como
+  defaults en Manual.
+- **Toggle Modo Express / Modo Manual** en el primer paso del wizard.
+
+### Agregado — recomendaciones LightBurn
+- `MaterialProfile` ampliado con campos `speed_mm_s_range`, `pass_through`,
+  `mirror_x_required`, `lightburn_invert`, `focus_mm`, `machine_compat`.
+- **Nuevo endpoint** `GET /api/recommended_settings/{material}`: devuelve JSON con
+  DPI, interval mm, power %, speed mm/s, pass-through, mirror, invert, focus mm,
+  + notas humanas para el operador.
+- **Panel `Configuración recomendada para LightBurn`** en el step Resultado del
+  wizard: tarjeta visible con cada valor listo para copiar al CAM.
+- Profiles actualizados con settings reales:
+  - `acrylic_funsun_9060_back_engrave`: DPI 115, interval 0.220 mm, 9–14% power,
+    400–600 mm/s, Pass-Through ON, MirrorX ON, LightBurn invert OFF, focus 7 mm.
+  - `acrylic_back_engrave` (genérico CO2 50W 2"): DPI 169, 9–14% power, 400–700 mm/s.
+  - `wood_generic`: DPI 141, 20–60% power, 250–500 mm/s, MirrorX OFF.
+
+### Cambiado
+- `MaterialInfo` (response model API) incluye los nuevos campos operacionales.
+- Lista de materiales `/api/materials` ahora expone `acrylic_funsun_9060_back_engrave`
+  como builtin (estaba sólo via auto-detect).
+- `MyConfig` default sugiere `acrylic_funsun_9060_back_engrave` (configuración del
+  usuario reportada).
+
+### Validación
+- `npm run check` 0 errors / 0 warnings.
+- `pytest tests/test_laser_physics.py tests/test_api_server.py -q`: 35+ passed.
+- Build estático SvelteKit OK.
+
 ## [1.2.0] — 2026-05-15
 
 ### Agregado — máxima calidad por imagen

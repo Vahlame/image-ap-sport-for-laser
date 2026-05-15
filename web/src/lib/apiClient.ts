@@ -50,6 +50,43 @@ export const DEFAULT_PARAMS: ProcessParams = {
 	max_side: 0
 };
 
+/** Mi-configuracion persistida en localStorage para flujo Express. */
+export interface MyConfig {
+	material: string;
+	output_mm_short: number;
+	output_dpi: number;
+	sharpen_radius_mm: number;
+}
+
+const MY_CONFIG_KEY = 'laser_app_my_config_v1';
+
+export function loadMyConfig(): MyConfig {
+	const fallback: MyConfig = {
+		material: 'acrylic_funsun_9060_back_engrave',
+		output_mm_short: 80,
+		output_dpi: 115,
+		sharpen_radius_mm: 0.1
+	};
+	if (typeof localStorage === 'undefined') return fallback;
+	try {
+		const raw = localStorage.getItem(MY_CONFIG_KEY);
+		if (!raw) return fallback;
+		const parsed = JSON.parse(raw) as Partial<MyConfig>;
+		return { ...fallback, ...parsed };
+	} catch {
+		return fallback;
+	}
+}
+
+export function saveMyConfig(c: MyConfig): void {
+	if (typeof localStorage === 'undefined') return;
+	try {
+		localStorage.setItem(MY_CONFIG_KEY, JSON.stringify(c));
+	} catch {
+		/* quota or disabled — silenciar */
+	}
+}
+
 /** Preset legacy: alta calidad agricultor (validado experimentalmente Sesion 3).
  *  Equivalente al preset 'poster_back_engrave' del backend. */
 export const PRESET_AGRICULTOR_HIGH_CONTRAST: ProcessParams = {
@@ -65,6 +102,24 @@ export const PRESET_AGRICULTOR_HIGH_CONTRAST: ProcessParams = {
 	invert: true,
 	preprocess_mode: 'sauvola'
 };
+
+export interface RecommendedSettings {
+	material: string;
+	machine_compat: string;
+	spot_mm: number;
+	focus_mm: number;
+	dpi: number;
+	interval_mm: number;
+	power_pct_min: number;
+	power_pct_max: number;
+	speed_mm_s_min: number;
+	speed_mm_s_max: number;
+	pass_through: boolean;
+	mirror_x_required: boolean;
+	lightburn_invert: boolean;
+	tone_response: string;
+	notes: string;
+}
 
 export interface PresetInfo {
 	name: string;
@@ -156,6 +211,10 @@ export const apiClient = {
 
 	async presets(): Promise<PresetInfo[]> {
 		return fetchJson<PresetInfo[]>('/api/presets');
+	},
+
+	async recommendedSettings(materialName: string): Promise<RecommendedSettings> {
+		return fetchJson<RecommendedSettings>(`/api/recommended_settings/${encodeURIComponent(materialName)}`);
 	},
 
 	async recommendPreset(imageBlob: Blob): Promise<RecommendationResult> {

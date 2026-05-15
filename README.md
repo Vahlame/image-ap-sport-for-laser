@@ -5,11 +5,12 @@ Preparación de imágenes para grabado láser CO2. Convierte una foto a color en
 láser cableada (DPI cap por spot, LUT por material, sharpen escalado al output
 físico, simulación de grabado).
 
-![Status](https://img.shields.io/badge/status-v1.2.0-success)
+![Status](https://img.shields.io/badge/status-v1.3.0-success)
 ![Tests](https://img.shields.io/badge/tests-140%2B%2F140%2B-success)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 ![Installer](https://img.shields.io/badge/installer-.exe%20available-success)
+![Mode](https://img.shields.io/badge/mode-Express-brightgreen)
 
 ---
 
@@ -63,18 +64,32 @@ Abrí `http://127.0.0.1:18765/app/` (build static servido por FastAPI) o
 
 ---
 
-## Workflow operador (5 pasos)
+## Modo Express (v1.3.0) ⚡ — recomendado
+
+El flujo más simple posible: subís una foto y la app la procesa con tu configuración guardada.
+
+1. Primera vez: abrís `⚙ Mi configuración` en el wizard y guardás:
+   - **Material**: ej. `acrylic_funsun_9060_back_engrave` (tu máquina).
+   - **Lado corto (mm)**: tamaño físico de la pieza.
+   - **DPI**: típicamente el `default_dpi` del material (115 para Funsun 2.5").
+2. Después arrastrás cualquier foto al dropzone Express.
+3. La app:
+   - Auto-detecta el tipo de imagen (foto/retrato/escena/poster/line-art).
+   - Aplica el preset adecuado con HQ refinement (25 candidatos sobol + scoring v5).
+   - Devuelve PNG laser-ready en 2–3 min.
+   - Muestra **`Configuración recomendada para LightBurn`** lista para copiar
+     (DPI, interval mm, power %, speed mm/s, MirrorX, Pass-Through, invertir).
+
+## Modo Manual (5 pasos) 🛠
+
+Para fotos donde querés tunear cada slider:
 
 1. **Subir** — drag-drop una foto (PNG/JPG/WebP, hasta 8000×8000 px).
 2. **Recortar** — encuadre con `cropper.js`.
-3. **Ajustes** — el wizard usa **preset `auto`** por defecto: detecta el tipo de imagen
-   (foto general, retrato, escena oscura/clara, poster, line art) y aplica los params
-   adecuados. Si querés tunear, cambiá a `manual` y movés sliders. Preview en vivo
-   (~300 ms debounce).
-4. **Resultado full-res** — PNG 1-bit + **simulación del grabado** (cómo se verá
-   fotografiado en acrílico frost o wood burn).
-5. **Descargar** — `laser_ready_<material>_<algoritmo>.png` + checklist pre-grabado
-   (mirror back-engrave, interval `25.4/DPI`, Pass-Through, 9–12% potencia acrílico).
+3. **Ajustes** — preset `auto` o manual. Material, mm, DPI, algoritmo, contrast/brightness/
+   gamma/sharpen. Preview en vivo (~300 ms debounce).
+4. **Resultado full-res** — PNG 1-bit + **simulación del grabado** + panel `Configuración LightBurn`.
+5. **Descargar** — `laser_ready_<material>_<algoritmo>.png` + checklist pre-grabado.
 
 ### Presets curados (v1.1.0+)
 

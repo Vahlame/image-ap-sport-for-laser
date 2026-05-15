@@ -1,7 +1,7 @@
 [project]
 name = "image-ap-sport-for-laser"
-version = "1.2.0"
-description = "Image-to-PNG laser preparation: wizard + FastAPI + CO2 physics-aware pipeline + auto-presets + HQ refinement"
+version = "1.3.0"
+description = "Image-to-PNG laser preparation: Express mode + auto-presets + HQ refinement + LightBurn recommendations"
 license = { text = "GPL-3.0-or-later" }
 readme = "README.md"
 requires-python = ">=3.11"

@@ -5,10 +5,14 @@
 		apiClient,
 		DEFAULT_PARAMS,
 		PRESET_AGRICULTOR_HIGH_CONTRAST,
+		loadMyConfig,
+		saveMyConfig,
 		type AlgorithmGroup,
 		type MaterialInfo,
+		type MyConfig,
 		type ProcessMeta,
 		type ProcessParams,
+		type RecommendedSettings,
 		type SimulateMeta
 	} from '$lib/apiClient';
 
@@ -49,6 +53,16 @@
 
 	let comparePos = $state(50);
 
+	// --- Mi configuracion persistida (Express mode) ---
+	let myConfig = $state<MyConfig>(loadMyConfig());
+	let showMyConfig = $state(false);
+	let expressMode = $state(true);  // default ON: subir foto → procesa automatico
+	let expressProgressMsg = $state<string>('');
+	let expressError = $state<string | null>(null);
+
+	// --- Recomendaciones LightBurn (cargadas tras procesar) ---
+	let recommendedSettings = $state<RecommendedSettings | null>(null);
+
 	const steps = [
 		{ n: 1 as const, label: 'Subir' },
 		{ n: 2 as const, label: 'Recortar' },
@@ -71,15 +85,102 @@
 				apiClient.materials(),
 				apiClient.algorithms()
 			]);
-			// Si no hay material seleccionado, sugerimos acrylic por defecto
-			if (!params.material && materials.some((m) => m.name === 'acrylic_back_engrave')) {
-				params.material = 'acrylic_back_engrave';
+			// Aplicar mi config persistida al material del pipeline si está disponible
+			if (myConfig.material && materials.some((m) => m.name === myConfig.material)) {
+				params.material = myConfig.material;
+			} else if (!params.material && materials.some((m) => m.name === 'acrylic_funsun_9060_back_engrave')) {
+				params.material = 'acrylic_funsun_9060_back_engrave';
+				myConfig.material = 'acrylic_funsun_9060_back_engrave';
+				saveMyConfig(myConfig);
 			}
 		} catch (err) {
 			backendOnline = false;
 			connectionError = err instanceof Error ? err.message : String(err);
 		}
 	});
+
+	function persistMyConfig() {
+		saveMyConfig(myConfig);
+	}
+
+	async function loadRecommendedSettings(materialName: string) {
+		if (!materialName) {
+			recommendedSettings = null;
+			return;
+		}
+		try {
+			recommendedSettings = await apiClient.recommendedSettings(materialName);
+		} catch (err) {
+			console.error('No se pudo cargar recommended_settings:', err);
+			recommendedSettings = null;
+		}
+	}
+
+	/** Modo Express: subir foto → procesa con MyConfig + preset=auto + HQ → result inmediato. */
+	async function expressProcess(file: File) {
+		expressError = null;
+		expressProgressMsg = 'Subiendo y analizando imagen...';
+
+		// 1. Crear cropped blob = imagen original (sin recortar manualmente)
+		// El usuario puede recortar después si lo necesita
+		const imageBlob = file;
+		revoke(croppedUrl);
+		revoke(finalBlobUrl);
+		revoke(simBlobUrl);
+		croppedBlob = imageBlob;
+		croppedUrl = URL.createObjectURL(imageBlob);
+		finalBlob = null;
+		finalBlobUrl = null;
+		simBlobUrl = null;
+		simMeta = null;
+
+		// 2. Componer params desde MyConfig + preset auto + HQ best
+		params = {
+			...DEFAULT_PARAMS,
+			preset: 'auto',
+			material: myConfig.material,
+			output_mm_short: myConfig.output_mm_short,
+			output_dpi: myConfig.output_dpi,
+			sharpen_radius_mm: myConfig.sharpen_radius_mm,
+		};
+
+		try {
+			expressProgressMsg = `Procesando con HQ refinement (puede tardar 2-3 min para máxima calidad)...`;
+			processingFull = true;
+			const { blob, meta } = await apiClient.render('process', imageBlob, params);
+			revoke(finalBlobUrl);
+			finalBlob = blob;
+			finalBlobUrl = URL.createObjectURL(blob);
+			finalMeta = meta;
+			expressProgressMsg = '';
+
+			// Cargar recomendaciones LightBurn
+			await loadRecommendedSettings(myConfig.material);
+
+			await tick();
+			step = 4;
+		} catch (err) {
+			expressError = err instanceof Error ? err.message : String(err);
+			expressProgressMsg = '';
+		} finally {
+			processingFull = false;
+		}
+	}
+
+	function onExpressDropzoneChange(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		const f = input.files?.[0];
+		if (!f) return;
+		if (!/^image\//.test(f.type)) {
+			expressError = 'Formato no soportado. Usa PNG, JPG o WebP.';
+			input.value = '';
+			return;
+		}
+		revoke(originalUrl);
+		originalUrl = URL.createObjectURL(f);
+		input.value = '';
+		void expressProcess(f);
+	}
 
 	function applyPreset(name: 'agricultor' | 'manual') {
 		preset = name;
@@ -299,25 +400,104 @@
 			</div>
 		{:else if step === 1}
 			<div class="panel">
-				<h2 class="title">Subir imagen</h2>
-				<p class="lede">
-					Subí una foto nítida. En el siguiente paso elegís solo el recorte que va al láser.
-				</p>
-				<label class="dropzone">
-					<input type="file" accept="image/png,image/jpeg,image/webp" onchange={onDropzoneChange} />
-					<span class="dropzone-icon" aria-hidden="true">
-						<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-							<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-							<polyline points="17 8 12 3 7 8" />
-							<line x1="12" y1="3" x2="12" y2="15" />
-						</svg>
-					</span>
-					<span class="dropzone-title">Arrastrá o hacé clic</span>
-					<span class="dropzone-sub">PNG · JPG · WebP — hasta ~8000×8000 px</span>
-				</label>
-				<p class="hint">
-					Tip: subí el archivo de mayor calidad/resolución que tengas. El recorte y resize al tamaño físico mm×DPI lo hace el pipeline.
-				</p>
+				<div class="mode-toggle">
+					<button class:active={expressMode} onclick={() => (expressMode = true)}>
+						⚡ Modo Express
+						<small>una foto → resultado, usa tu configuración</small>
+					</button>
+					<button class:active={!expressMode} onclick={() => (expressMode = false)}>
+						🛠 Modo Manual
+						<small>recortás, ajustás sliders, previews en vivo</small>
+					</button>
+				</div>
+
+				<details class="my-config-panel" open={!myConfig.material}>
+					<summary>
+						<span>⚙ Mi configuración</span>
+						<code class="my-config-summary">
+							{myConfig.material || 'sin material'} · {myConfig.output_mm_short}mm @ {myConfig.output_dpi}DPI
+						</code>
+					</summary>
+					<p class="hint">
+						Estos valores se guardan en tu navegador. Se usan en modo Express y como defaults en Manual.
+					</p>
+					<div class="grid2">
+						<div class="field">
+							<label for="mc-mat">Material por defecto</label>
+							<select id="mc-mat" bind:value={myConfig.material} onchange={persistMyConfig}>
+								<option value="">— elegir —</option>
+								{#each materials as m (m.name)}
+									<option value={m.name}>{m.name}</option>
+								{/each}
+							</select>
+						</div>
+						<div class="field">
+							<label for="mc-mm">Lado corto (mm)</label>
+							<input id="mc-mm" type="number" step="0.5" min="5" bind:value={myConfig.output_mm_short} onchange={persistMyConfig} />
+						</div>
+						<div class="field">
+							<label for="mc-dpi">DPI</label>
+							<input id="mc-dpi" type="number" step="1" min="50" max="600" bind:value={myConfig.output_dpi} onchange={persistMyConfig} />
+						</div>
+						<div class="field">
+							<label for="mc-sr">Sharpen radius (mm)</label>
+							<input id="mc-sr" type="number" step="0.01" min="0.05" max="2" bind:value={myConfig.sharpen_radius_mm} onchange={persistMyConfig} />
+						</div>
+					</div>
+				</details>
+
+				{#if expressMode}
+					<h2 class="title">Modo Express</h2>
+					<p class="lede">
+						Subí una foto y la app la procesa automáticamente con tu configuración guardada
+						(material <code>{myConfig.material || '—'}</code>, {myConfig.output_mm_short}mm @ {myConfig.output_dpi}DPI)
+						+ auto-detección de preset + HQ refinement. Tarda ~2–3 minutos por imagen full-res.
+					</p>
+					<label class="dropzone dropzone-express">
+						<input type="file" accept="image/png,image/jpeg,image/webp"
+						       onchange={onExpressDropzoneChange}
+						       disabled={processingFull || !myConfig.material} />
+						<span class="dropzone-icon" aria-hidden="true">
+							<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+								<path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z" />
+							</svg>
+						</span>
+						<span class="dropzone-title">{processingFull ? 'Procesando…' : 'Arrastrá tu foto'}</span>
+						<span class="dropzone-sub">
+							{#if !myConfig.material}
+								Primero seleccioná un material en "Mi configuración" ↑
+							{:else}
+								PNG · JPG · WebP — procesado automático con HQ refinement
+							{/if}
+						</span>
+					</label>
+					{#if expressProgressMsg}
+						<p class="preset-progress">⏳ {expressProgressMsg}</p>
+					{/if}
+					{#if expressError}
+						<p class="warn">⚠ {expressError}</p>
+					{/if}
+				{:else}
+					<h2 class="title">Modo Manual</h2>
+					<p class="lede">
+						Subí una foto nítida. En el siguiente paso elegís el recorte y después tunear con sliders.
+					</p>
+					<label class="dropzone">
+						<input type="file" accept="image/png,image/jpeg,image/webp" onchange={onDropzoneChange} />
+						<span class="dropzone-icon" aria-hidden="true">
+							<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+								<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+								<polyline points="17 8 12 3 7 8" />
+								<line x1="12" y1="3" x2="12" y2="15" />
+							</svg>
+						</span>
+						<span class="dropzone-title">Arrastrá o hacé clic</span>
+						<span class="dropzone-sub">PNG · JPG · WebP — hasta ~8000×8000 px</span>
+					</label>
+					<p class="hint">
+						Tip: subí el archivo de mayor calidad/resolución que tengas. El recorte y resize al tamaño físico mm×DPI lo hace el pipeline.
+					</p>
+				{/if}
 			</div>
 		{:else if step === 2 && originalUrl}
 			{#key originalUrl}
@@ -520,6 +700,28 @@
 					</figure>
 				</div>
 
+				{#if recommendedSettings}
+					<section class="lightburn-card">
+						<h3>📋 Configuración recomendada para LightBurn</h3>
+						<p class="hint">
+							Material <code>{recommendedSettings.material}</code>
+							{#if recommendedSettings.machine_compat}· {recommendedSettings.machine_compat}{/if}
+						</p>
+						<div class="lb-grid">
+							<div><span class="lb-label">DPI</span><span class="lb-val">{recommendedSettings.dpi}</span></div>
+							<div><span class="lb-label">Interval mm</span><span class="lb-val">{recommendedSettings.interval_mm.toFixed(3)}</span></div>
+							<div><span class="lb-label">Power %</span><span class="lb-val">{recommendedSettings.power_pct_min}–{recommendedSettings.power_pct_max}</span></div>
+							<div><span class="lb-label">Speed mm/s</span><span class="lb-val">{recommendedSettings.speed_mm_s_min.toFixed(0)}–{recommendedSettings.speed_mm_s_max.toFixed(0)}</span></div>
+							<div><span class="lb-label">Pass-Through</span><span class="lb-val">{recommendedSettings.pass_through ? '✓ ON' : '✗ OFF'}</span></div>
+							<div><span class="lb-label">MirrorX</span><span class="lb-val">{recommendedSettings.mirror_x_required ? '✓ ON (back-engrave)' : '— no necesario'}</span></div>
+							<div><span class="lb-label">Invert en LightBurn</span><span class="lb-val">{recommendedSettings.lightburn_invert ? '✓ ON' : '✗ OFF (el PNG ya está listo)'}</span></div>
+							<div><span class="lb-label">Focus mm</span><span class="lb-val">{recommendedSettings.focus_mm > 0 ? recommendedSettings.focus_mm.toFixed(1) : '—'}</span></div>
+						</div>
+						{#if recommendedSettings.notes}
+							<p class="hint lb-notes">💡 {recommendedSettings.notes}</p>
+						{/if}
+					</section>
+				{/if}
 				<div class="actions">
 					<button type="button" class="btn btn-secondary" onclick={() => (step = 3)}>← Ajustar</button>
 					<button type="button" class="btn btn-primary" onclick={() => { step = 5; }}>Descargar PNG →</button>
@@ -1004,4 +1206,130 @@
 		flex-wrap: wrap;
 		justify-content: center;
 	}
+
+	/* Mode toggle (Express vs Manual) */
+	.mode-toggle {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 0.6rem;
+		margin-bottom: 1.4rem;
+	}
+	.mode-toggle button {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+		align-items: flex-start;
+		padding: 1rem 1.2rem;
+		background: rgba(0, 0, 0, 0.25);
+		border: 1px solid var(--border);
+		border-radius: 12px;
+		color: var(--text-muted);
+		font-family: inherit;
+		font-size: 0.95rem;
+		font-weight: 600;
+		cursor: pointer;
+		text-align: left;
+		transition: all 0.18s ease;
+	}
+	.mode-toggle button:hover { border-color: var(--border-strong); color: var(--text); }
+	.mode-toggle button.active {
+		background: linear-gradient(135deg, rgba(142, 224, 107, 0.18), rgba(94, 163, 66, 0.1));
+		border-color: var(--accent);
+		color: var(--text);
+		box-shadow: 0 0 14px var(--accent-glow);
+	}
+	.mode-toggle small {
+		font-size: 0.75rem;
+		font-weight: 400;
+		color: var(--text-faint);
+		letter-spacing: 0;
+	}
+	.mode-toggle button.active small { color: var(--text-muted); }
+
+	/* Mi configuración */
+	.my-config-panel {
+		border: 1px solid var(--border);
+		border-radius: 10px;
+		margin-bottom: 1.2rem;
+		padding: 0.4rem 0.9rem;
+		background: rgba(0, 0, 0, 0.18);
+	}
+	.my-config-panel summary {
+		cursor: pointer;
+		padding: 0.5rem 0;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 0.6rem;
+		font-size: 0.9rem;
+		font-weight: 600;
+		color: var(--text);
+		list-style: none;
+	}
+	.my-config-panel summary::-webkit-details-marker { display: none; }
+	.my-config-panel[open] summary { color: var(--accent); }
+	.my-config-summary {
+		font-size: 0.78rem;
+		font-weight: 400;
+		color: var(--text-muted);
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+		background: rgba(0, 0, 0, 0.3);
+		padding: 0.2rem 0.5rem;
+		border-radius: 6px;
+	}
+
+	.dropzone-express {
+		border-color: var(--accent);
+		background: rgba(142, 224, 107, 0.06);
+	}
+	.dropzone-express:hover {
+		background: rgba(142, 224, 107, 0.12);
+		box-shadow: 0 0 14px var(--accent-glow);
+	}
+
+	.preset-progress {
+		margin-top: 1rem;
+		padding: 0.7rem 1rem;
+		background: rgba(142, 224, 107, 0.10);
+		border-left: 3px solid var(--accent);
+		border-radius: 6px;
+		color: var(--text);
+		font-size: 0.9rem;
+	}
+
+	/* LightBurn recommendations card */
+	.lightburn-card {
+		margin: 1.4rem 0 0;
+		padding: 1.1rem 1.2rem;
+		background: rgba(142, 224, 107, 0.06);
+		border: 1px solid var(--border-strong);
+		border-radius: 12px;
+	}
+	.lightburn-card h3 {
+		margin: 0 0 0.4rem;
+		color: var(--accent);
+		font-size: 1.05rem;
+	}
+	.lb-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+		gap: 0.5rem 1rem;
+		margin: 0.6rem 0;
+	}
+	.lb-grid > div {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.5rem;
+		padding: 0.4rem 0.6rem;
+		background: rgba(0, 0, 0, 0.25);
+		border-radius: 6px;
+	}
+	.lb-label { color: var(--text-muted); font-size: 0.82rem; }
+	.lb-val {
+		color: var(--accent);
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+		font-size: 0.85rem;
+		font-weight: 600;
+	}
+	.lb-notes { margin-top: 0.8rem; }
 </style>

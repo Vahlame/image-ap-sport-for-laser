@@ -157,6 +157,8 @@ class MaterialProfile:
     - LUT inversa (256 elementos) compensando dot-gain + respuesta tonal del material
     - tipo de respuesta (monotonic / non_monotonic / linear)
     - rango de potencia recomendado (% maquina)
+    - rango de velocidad recomendado (mm/s)
+    - recomendaciones operacionales LightBurn (Pass-Through, mirror, invert, etc.)
     - notas humanas
 
     LUTs reales se calibran via step-wedge fisico (Fase R7); estos stubs son aproximaciones
@@ -169,6 +171,12 @@ class MaterialProfile:
     lut_curve: np.ndarray = field(default_factory=identity_lut)
     tone_response: ToneResponseKind = "monotonic"
     power_pct_range: tuple[float, float] = (5.0, 100.0)
+    speed_mm_s_range: tuple[float, float] = (200.0, 600.0)
+    pass_through: bool = True
+    mirror_x_required: bool = False
+    lightburn_invert: bool = False
+    focus_mm: float = 0.0  # Distancia focal al material (informativo; 0 = no especificado)
+    machine_compat: str = ""  # Etiqueta de maquina compatible (ej. "Funsun 9060 lente 2.5\"")
     notes: str = ""
 
     def __post_init__(self) -> None:
@@ -182,6 +190,9 @@ class MaterialProfile:
         lo, hi = self.power_pct_range
         if not (0 <= lo <= hi <= 100):
             raise ValueError(f"power_pct_range invalido {self.power_pct_range} ({self.name})")
+        slo, shi = self.speed_mm_s_range
+        if not (0 < slo <= shi <= 5000):
+            raise ValueError(f"speed_mm_s_range invalido {self.speed_mm_s_range} ({self.name})")
 
     def max_useful_dpi(self) -> int:
         return estimate_max_useful_dpi(self.spot_mm)
@@ -191,6 +202,26 @@ class MaterialProfile:
 
     def lut(self) -> Callable[[np.ndarray], np.ndarray]:
         return make_lut_callable(self.lut_curve)
+
+    def recommended_settings_dict(self) -> dict:
+        """Snapshot serializable de recomendaciones operacionales para enviar al cliente."""
+        return {
+            "material": self.name,
+            "machine_compat": self.machine_compat,
+            "spot_mm": self.spot_mm,
+            "focus_mm": self.focus_mm,
+            "dpi": self.default_dpi,
+            "interval_mm": round(25.4 / self.default_dpi, 4),
+            "power_pct_min": self.power_pct_range[0],
+            "power_pct_max": self.power_pct_range[1],
+            "speed_mm_s_min": self.speed_mm_s_range[0],
+            "speed_mm_s_max": self.speed_mm_s_range[1],
+            "pass_through": self.pass_through,
+            "mirror_x_required": self.mirror_x_required,
+            "lightburn_invert": self.lightburn_invert,
+            "tone_response": self.tone_response,
+            "notes": self.notes,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +246,10 @@ def _compose_luts(*luts: np.ndarray) -> np.ndarray:
     return out
 
 
+def _acrylic_back_engrave_legacy() -> MaterialProfile:  # noqa: F811 (placeholder slot)
+    pass
+
+
 def acrylic_back_engrave_profile() -> MaterialProfile:
     """
     Acrilico colado, back-engrave a baja potencia (frost blanco lechoso por scattering Mie).
@@ -236,9 +271,15 @@ def acrylic_back_engrave_profile() -> MaterialProfile:
         lut_curve=_gamma_lut(0.65),
         tone_response="monotonic",
         power_pct_range=(9.0, 14.0),
+        speed_mm_s_range=(400.0, 700.0),
+        pass_through=True,
+        mirror_x_required=True,
+        lightburn_invert=False,
+        focus_mm=0.0,  # generico (depende de lente)
+        machine_compat="CO2 50W lente 2\" (generico)",
         notes=(
             "Acrilico colado, cara posterior, baja potencia. LUT gamma 0.65 aproxima "
-            "compensacion dot-gain Funsun 50W. Calibrar con step-wedge real."
+            "compensacion dot-gain. Calibrar con step-wedge real para tu maquina."
         ),
     )
 
@@ -286,9 +327,17 @@ def acrylic_funsun_9060_back_engrave_profile() -> MaterialProfile:
         lut_curve=_gamma_lut(0.55),
         tone_response="monotonic",
         power_pct_range=(9.0, 14.0),
+        speed_mm_s_range=(400.0, 600.0),
+        pass_through=True,
+        mirror_x_required=True,  # Back-engrave: grabar cara posterior -> espejar
+        lightburn_invert=False,  # PNG ya esta en polaridad correcta
+        focus_mm=7.0,
+        machine_compat="Funsun 9060 + lente 2.5\"",
         notes=(
             "Funsun 9060 + lente 2.5\" + focus 7mm. Spot 0.22mm -> DPI MAX 115. "
-            "Power 9-12% para frost limpio. Configuracion del usuario reportada."
+            "Power 9-12% para frost limpio. NO invertir en LightBurn (el PNG ya esta listo). "
+            "MirrorX ON porque es back-engrave (grabas la cara posterior). "
+            "Velocidad 400-500 mm/s para dots crisp; mas lento corre riesgo de fundir."
         ),
     )
 
@@ -314,9 +363,16 @@ def wood_profile() -> MaterialProfile:
         lut_curve=_wood_dual_phase_lut(),
         tone_response="non_monotonic",
         power_pct_range=(20.0, 60.0),
+        speed_mm_s_range=(250.0, 500.0),
+        pass_through=True,
+        mirror_x_required=False,
+        lightburn_invert=False,
+        focus_mm=0.0,
+        machine_compat="CO2 50W lente 2\" (generico)",
         notes=(
             "Madera generica, respuesta tonal no-monotonica (pirolisis + sublimacion lignina). "
-            "LUT comprime extremo claro para evitar zona de rebote. Calibrar por especie."
+            "LUT comprime extremo claro para evitar zona de rebote. Calibrar por especie. "
+            "Air assist 3-5 psi limpia char y aumenta contraste."
         ),
     )
 

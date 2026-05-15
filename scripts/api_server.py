@@ -107,6 +107,31 @@ class MaterialInfo(BaseModel):
     power_pct_range: tuple[float, float]
     notes: str
     source: str  # "builtin" | "custom"
+    # Nuevos v1.3 (opcionales para retrocompat con perfiles custom JSON sin estos campos)
+    speed_mm_s_range: tuple[float, float] = (200.0, 600.0)
+    pass_through: bool = True
+    mirror_x_required: bool = False
+    lightburn_invert: bool = False
+    focus_mm: float = 0.0
+    machine_compat: str = ""
+
+
+class RecommendedSettings(BaseModel):
+    material: str
+    machine_compat: str
+    spot_mm: float
+    focus_mm: float
+    dpi: int
+    interval_mm: float
+    power_pct_min: float
+    power_pct_max: float
+    speed_mm_s_min: float
+    speed_mm_s_max: float
+    pass_through: bool
+    mirror_x_required: bool
+    lightburn_invert: bool
+    tone_response: str
+    notes: str
 
 
 class AlgorithmGroup(BaseModel):
@@ -420,26 +445,35 @@ def health() -> HealthResponse:
     )
 
 
+def _material_info_from_profile(p, source: str) -> MaterialInfo:
+    return MaterialInfo(
+        name=p.name, spot_mm=p.spot_mm, default_dpi=p.default_dpi,
+        tone_response=p.tone_response, power_pct_range=p.power_pct_range,
+        notes=p.notes, source=source,
+        speed_mm_s_range=getattr(p, "speed_mm_s_range", (200.0, 600.0)),
+        pass_through=getattr(p, "pass_through", True),
+        mirror_x_required=getattr(p, "mirror_x_required", False),
+        lightburn_invert=getattr(p, "lightburn_invert", False),
+        focus_mm=getattr(p, "focus_mm", 0.0),
+        machine_compat=getattr(p, "machine_compat", ""),
+    )
+
+
 @app.get("/api/materials", response_model=list[MaterialInfo])
 def list_materials() -> list[MaterialInfo]:
     """Lista builtins + presets custom de presets/materials/."""
     results: list[MaterialInfo] = []
-    # Builtins programaticos
     builtins = [
         ("acrylic_back_engrave", "builtin"),
+        ("acrylic_funsun_9060_back_engrave", "builtin"),
         ("wood_generic", "builtin"),
     ]
     for name, source in builtins:
         try:
             p = laser_physics.load_material_profile(name)
-            results.append(MaterialInfo(
-                name=p.name, spot_mm=p.spot_mm, default_dpi=p.default_dpi,
-                tone_response=p.tone_response, power_pct_range=p.power_pct_range,
-                notes=p.notes, source=source,
-            ))
+            results.append(_material_info_from_profile(p, source))
         except Exception:
             continue
-    # JSON custom (si existe presets/materials/)
     presets_dir = _REPO_ROOT / "presets" / "materials"
     if presets_dir.is_dir():
         for json_file in presets_dir.glob("*.json"):
@@ -448,14 +482,26 @@ def list_materials() -> list[MaterialInfo]:
                 continue
             try:
                 p = laser_physics.load_material_profile(name, presets_dir=presets_dir)
-                results.append(MaterialInfo(
-                    name=p.name, spot_mm=p.spot_mm, default_dpi=p.default_dpi,
-                    tone_response=p.tone_response, power_pct_range=p.power_pct_range,
-                    notes=p.notes, source="custom",
-                ))
+                results.append(_material_info_from_profile(p, "custom"))
             except Exception:
                 continue
     return results
+
+
+@app.get("/api/recommended_settings/{material_name}", response_model=RecommendedSettings)
+def get_recommended_settings(material_name: str) -> RecommendedSettings:
+    """
+    Devuelve la configuracion recomendada para LightBurn / CAM del laser, dado un material.
+
+    Incluye: DPI, interval mm, power %, speed mm/s, pass-through, mirror, invert, focus mm.
+    """
+    presets_dir = _REPO_ROOT / "presets" / "materials"
+    try:
+        p = laser_physics.load_material_profile(material_name, presets_dir=presets_dir)
+    except (KeyError, ValueError, FileNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=f"material '{material_name}' no encontrado: {exc}") from exc
+    d = p.recommended_settings_dict()
+    return RecommendedSettings(**d)
 
 
 @app.get("/api/presets")
