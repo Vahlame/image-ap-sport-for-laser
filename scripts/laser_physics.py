@@ -38,7 +38,12 @@ SPOT_SIZE_DEFAULTS_MM: dict[str, float] = {
     "co2_50w_lens_4inch": 0.30,
     "co2_80w_lens_2inch": 0.18,
     "co2_100w_lens_2inch": 0.20,
-    "funsun_50w_default": 0.15,  # ver `PROJECTS/image-ap-sport-for-laser` §"acrylic 9-12%"
+    "funsun_50w_default": 0.15,
+    # Funsun 9060 con lente 2.5" (usuario reportado): spot estimado 0.22 mm
+    # -> DPI util maximo 115. Focus 7 mm del material.
+    "funsun_9060_lens_2_5inch": 0.22,
+    "funsun_9060_lens_2inch": 0.17,
+    "funsun_9060_lens_4inch": 0.32,
     "unknown": 0.18,  # peor-caso conservador para warning
 }
 
@@ -259,6 +264,35 @@ def _wood_dual_phase_lut() -> np.ndarray:
     return np.clip(np.round(out * 255.0), 0, 255).astype(np.uint8)
 
 
+def acrylic_funsun_9060_back_engrave_profile() -> MaterialProfile:
+    """
+    Acrilico back-engrave en Funsun 9060 con lente 2.5" (configuracion usuario reportada).
+
+    Caracteristicas:
+      - Lente 2.5" -> spot ~0.22 mm (vs 0.15 mm de 2"). DPI util maximo ~115.
+      - Focus 7 mm desde la boquilla al material (estandar para 2.5").
+      - Potencia 9-12% para frost limpio (tube 80-100W CO2 RECI).
+
+    LUT gamma 0.55 (mas agresiva que 2" porque el spot mayor genera mas overlap
+    y necesita compensacion de dot-gain mas fuerte).
+
+    IMPORTANTE: con esta configuracion NO subir DPI > 115. En LightBurn:
+    interval = 25.4/115 = 0.220 mm. Subir mas solo causa overlap y mush.
+    """
+    return MaterialProfile(
+        name="acrylic_funsun_9060_back_engrave",
+        spot_mm=0.22,
+        default_dpi=115,
+        lut_curve=_gamma_lut(0.55),
+        tone_response="monotonic",
+        power_pct_range=(9.0, 14.0),
+        notes=(
+            "Funsun 9060 + lente 2.5\" + focus 7mm. Spot 0.22mm -> DPI MAX 115. "
+            "Power 9-12% para frost limpio. Configuracion del usuario reportada."
+        ),
+    )
+
+
 def wood_profile() -> MaterialProfile:
     """
     Madera (default generico, baja densidad tipo MDF/contrachapado).
@@ -295,6 +329,7 @@ def wood_profile() -> MaterialProfile:
 def _builtin_profiles() -> dict[str, Callable[[], MaterialProfile]]:
     return {
         "acrylic_back_engrave": acrylic_back_engrave_profile,
+        "acrylic_funsun_9060_back_engrave": acrylic_funsun_9060_back_engrave_profile,
         "wood_generic": wood_profile,
     }
 

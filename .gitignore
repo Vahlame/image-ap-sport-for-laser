@@ -42,6 +42,9 @@ Thumbs.db
 *.swp
 .claude/
 
+# Inno Setup output (binarios generados; se sube como release asset, no a git)
+installer/Output/
+
 # Imágenes sueltas en raíz que el usuario dropea
 /imagr_acrylic_*.png
 /foto*.jpeg

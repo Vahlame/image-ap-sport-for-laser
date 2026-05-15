@@ -163,6 +163,37 @@ PRESET_POSTER_BACK_ENGRAVE = LaserPreset(
     suggested_material="acrylic_back_engrave",
 )
 
+# Preset NUEVO (v1.2): FOTO sobre acrilico back-engrave.
+# El problema observado con poster_back_engrave aplicado a fotos: midtones excesivos
+# -> frost muy parejo, sin definicion. Esta variante usa:
+#   - stucki_serpentine: kernel grande con error mejor distribuido -> dots mas crisp
+#   - gamma 1.55: aplasta midtones para que solo highlights/shadows fuertes generen frost
+#   - threshold 105: balance frost/transparente para foto (no 75 que era para text)
+#   - autocontrast 3.5: fuerza contraste sin perder informacion en extremos
+#   - sharpen 120: realza bordes para que la foto no se vea borrosa al hacer halftone
+#   - NO invert: para acrilico back-engrave, las luces de la foto = frost visible
+#     (el usuario debe NO invertir tambien en LightBurn).
+PRESET_PHOTO_BACK_ENGRAVE = LaserPreset(
+    name="photo_back_engrave",
+    label="Foto sobre acrílico back-engrave",
+    description="Foto natural destinada a grabarse en la cara posterior de acrílico (sujeto visible "
+                "como frost blanco al ver desde el frente, fondo transparente). Invertido para que "
+                "el sujeto oscuro de la foto = white en PNG = frost. Stucki serpentine + gamma alta "
+                "+ contraste fuerte + sharpen muy alto + threshold bajo para que los dots queden "
+                "DEFINIDOS y no se vea borroso al grabar. NO subir invert/threshold en LightBurn — "
+                "el PNG ya está listo para Pass-Through.",
+    algorithm="stucki_serpentine",
+    preprocess_mode="sauvola",
+    threshold=95,
+    contrast=1.35,
+    brightness=0.0,
+    gamma=1.55,
+    autocontrast=3.5,
+    sharpen=130.0,
+    invert=True,
+    suggested_material="acrylic_funsun_9060_back_engrave",
+)
+
 PRESET_LINE_ART = LaserPreset(
     name="line_art",
     label="Line art / vector",
@@ -187,6 +218,7 @@ ALL_PRESETS: tuple[LaserPreset, ...] = (
     PRESET_SCENE_DARK,
     PRESET_SCENE_BRIGHT,
     PRESET_POSTER_BACK_ENGRAVE,
+    PRESET_PHOTO_BACK_ENGRAVE,
     PRESET_LINE_ART,
 )
 
@@ -238,9 +270,17 @@ class Recommendation:
     stats: ImageStats
 
 
-def recommend_preset(rgb: np.ndarray) -> Recommendation:
-    """Decide el preset óptimo según estadísticos. Orden importa (primer match gana)."""
+def recommend_preset(rgb: np.ndarray, *, material: str = "") -> Recommendation:
+    """
+    Decide el preset óptimo según estadísticos. Orden importa (primer match gana).
+
+    Si `material` empieza con `"acrylic"`, las recomendaciones de fotos cambian:
+    usa `photo_back_engrave` en vez de `photo_general`/`portrait`/`scene_*` — porque
+    en acrílico el halftone necesita mucho más contraste/sharpen + spot mayor que
+    en madera para que los dots se vean definidos al grabar.
+    """
     s = compute_image_stats(rgb)
+    is_acrylic = material.startswith("acrylic")
 
     # Regla 1: bimodal alto contraste + bordes finos → poster/gráfico
     if s.extreme_ratio > 0.5 and s.edge_density > 0.08:
@@ -263,6 +303,20 @@ def recommend_preset(rgb: np.ndarray) -> Recommendation:
             reason=(
                 f"Mucha densidad de bordes ({s.edge_density*100:.0f}%) — "
                 f"característico de line art / texto."
+            ),
+            stats=s,
+        )
+
+    # Si el material es acrílico back-engrave, TODAS las fotos van al preset acrílico-específico
+    # (no usar scene_dark/bright que están tuneados para madera).
+    if is_acrylic:
+        return Recommendation(
+            preset_name=PRESET_PHOTO_BACK_ENGRAVE.name,
+            preset_label=PRESET_PHOTO_BACK_ENGRAVE.label,
+            reason=(
+                f"Foto sobre acrílico back-engrave (material='{material}'). "
+                f"Usa preset con contraste/sharpen/gamma altos y threshold bajo "
+                f"para que los dots del halftone queden definidos al grabar a DPI bajo."
             ),
             stats=s,
         )

@@ -5,10 +5,11 @@ Preparación de imágenes para grabado láser CO2. Convierte una foto a color en
 láser cableada (DPI cap por spot, LUT por material, sharpen escalado al output
 físico, simulación de grabado).
 
-![Status](https://img.shields.io/badge/status-v1.1.0-success)
-![Tests](https://img.shields.io/badge/tests-130%2B%2F130%2B-success)
+![Status](https://img.shields.io/badge/status-v1.2.0-success)
+![Tests](https://img.shields.io/badge/tests-140%2B%2F140%2B-success)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
+![Installer](https://img.shields.io/badge/installer-.exe%20available-success)
 
 ---
 
@@ -27,17 +28,23 @@ físico, simulación de grabado).
 
 ## Quickstart (Windows)
 
-### Doble-clic (recomendado)
+### Opción 1 — Instalador `.exe` (recomendado, doble-clic)
 
-1. Instalación una vez (Terminal PowerShell):
-   ```powershell
-   cd "C:\ruta\image ap sport for laser"
-   python -m venv .venv312
-   .\.venv312\Scripts\Activate.ps1
-   pip install -e ".[api,perceptual,dev]"
-   cd web; npm install; npm run build; cd ..
-   ```
-2. Doble-clic en **`Iniciar Laser App.bat`** → se abre el wizard en el navegador.
+1. Descargar `ImageAPLaser_Setup_v1.2.0.exe` desde
+   [GitHub Releases](https://github.com/Vahlame/image-ap-sport-for-laser/releases/latest).
+2. Doble-clic → asistente estándar Windows (idioma, licencia, carpeta destino).
+3. Al terminar, Setup ejecuta automáticamente la instalación de Python, Node, y
+   dependencias (via `winget`). Tarda ~15–30 min la primera vez.
+4. Acceso directo "Image AP Laser" creado en el Escritorio → doble-clic para arrancar.
+
+### Opción 2 — Manual (developers / sin Internet en instalación)
+
+```powershell
+git clone https://github.com/Vahlame/image-ap-sport-for-laser
+cd image-ap-sport-for-laser
+Setup_LaserApp.bat       # configura todo: winget → Python/Node → venv → deps → web build
+Iniciar_Laser_App.bat    # arranca uvicorn + abre el wizard en el navegador
+```
 
 ### Manual (dos terminales)
 

@@ -71,6 +71,11 @@ class ProcessParams(BaseModel):
         description="Si se pasa nombre de preset (e.g. 'photo_general', 'auto'), aplica esos "
         "params como base; campos explicitos en este JSON SOBREESCRIBEN el preset."
     )
+    quality_mode: str = Field(
+        default="fast",
+        description="'fast' (1 render) o 'best' (sobol search ~24 candidatos + v5 scoring). "
+        "/api/process default 'best'; /api/preview default 'fast'."
+    )
     material: str = Field(default="", description="Nombre MaterialProfile o vacio")
     output_mm_short: float = Field(default=0.0, ge=0, description="Lado corto fisico en mm (0=no escalar USM)")
     output_dpi: int = Field(default=0, ge=0, le=2400, description="DPI del grabado final (0=no aplicar)")
@@ -187,7 +192,8 @@ def _resolve_preset_overrides(params: ProcessParams, img_rgb: Image.Image) -> tu
     detector_reason = ""
     if preset_name == "auto":
         rgb_arr = np.array(img_rgb.convert("RGB"))
-        rec = laser_presets.recommend_preset(rgb_arr)
+        # Pasar material para que el detector use el preset acrilico-especifico si aplica
+        rec = laser_presets.recommend_preset(rgb_arr, material=params.material)
         preset_name = rec.preset_name
         detector_reason = rec.reason
 
@@ -214,6 +220,85 @@ def _resolve_preset_overrides(params: ProcessParams, img_rgb: Image.Image) -> tu
         merged["material"] = preset.suggested_material
 
     return ProcessParams(**merged), preset_name, detector_reason
+
+
+def _hq_refine(base_gray: np.ndarray, base_params: ProcessParams) -> tuple[np.ndarray, dict, ltm.Candidate]:
+    """
+    HQ refinement: corre un sobol-search local (~24 variantes alrededor de los params dados)
+    y devuelve el mejor por score v5 (no-reference: HVS-MSE + spectral radial + tone post-LUT).
+
+    Cuesta tiempo (~30-90s para imágenes full-res en CPU; menos con CUDA en LPIPS).
+
+    Sobol explora 5 dimensiones:
+        threshold ± 16
+        contrast ± 0.20
+        brightness ± 12
+        gamma ± 0.20
+        sharpen ± 30
+
+    Returns: (best_binary_output, debug_dict, winning_candidate)
+    """
+    from scipy.stats import qmc
+
+    # base candidate
+    base_cand = ltm.Candidate(
+        algorithm=base_params.algorithm,
+        invert=base_params.invert,
+        threshold=int(base_params.threshold),
+        contrast=float(base_params.contrast),
+        brightness=float(base_params.brightness),
+        gamma=float(base_params.gamma),
+        autocontrast=float(base_params.autocontrast),
+        sharpen=float(base_params.sharpen),
+    )
+
+    # Sobol 5D, 24 puntos (siempre incluimos el baseline como punto 0)
+    sobol = qmc.Sobol(d=5, seed=2026, scramble=True).random(24)
+    variants: list[ltm.Candidate] = [base_cand]
+    for s in sobol:
+        thr = int(np.clip(base_cand.threshold + (s[0] - 0.5) * 32, 30, 220))
+        c = float(np.clip(base_cand.contrast + (s[1] - 0.5) * 0.40, 0.4, 2.2))
+        b = float(np.clip(base_cand.brightness + (s[2] - 0.5) * 24, -50, 50))
+        g = float(np.clip(base_cand.gamma + (s[3] - 0.5) * 0.40, 0.5, 2.2))
+        sh = float(np.clip(base_cand.sharpen + (s[4] - 0.5) * 60, 0, 250))
+        variants.append(ltm.Candidate(
+            algorithm=base_cand.algorithm, invert=base_cand.invert,
+            threshold=thr, contrast=c, brightness=b, gamma=g,
+            autocontrast=base_cand.autocontrast, sharpen=sh,
+        ))
+
+    # Score v5 sin referencia: usamos el base_gray como "gris ideal"
+    target_gray_v5 = base_gray.astype(np.float64)
+    dummy_binary = np.zeros_like(base_gray, dtype=np.uint8)
+    dummy_density = np.zeros((max(1, base_gray.shape[0] // 4), max(1, base_gray.shape[1] // 4)), dtype=np.float64)
+    dummy_edges = np.zeros_like(base_gray, dtype=np.float64)
+
+    best_score = float("inf")
+    best_out: np.ndarray | None = None
+    best_cand: ltm.Candidate | None = None
+    scores_log: list[tuple[float, ltm.Candidate]] = []
+    t0 = time.perf_counter()
+    for cand in variants:
+        out = ltm.render_candidate(base_gray, cand)
+        score, *_ = laser_scoring.score_candidate_dispatch(
+            "v5", out, target_gray_v5, dummy_binary, dummy_density, dummy_edges, cand,
+        )
+        scores_log.append((float(score), cand))
+        if score < best_score:
+            best_score = score
+            best_out = out
+            best_cand = cand
+    elapsed = time.perf_counter() - t0
+
+    assert best_out is not None and best_cand is not None
+    debug = {
+        "candidates_evaluated": len(variants),
+        "best_score_v5": best_score,
+        "baseline_score_v5": scores_log[0][0],
+        "improvement_v5": scores_log[0][0] - best_score,
+        "refine_seconds": elapsed,
+    }
+    return best_out, debug, best_cand
 
 
 def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndarray, dict]:
@@ -253,20 +338,31 @@ def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndar
             detail=f"algorithm '{params.algorithm}' no soportado. Lista en /api/algorithms.",
         )
 
-    # Construir candidate y renderizar
-    cand = ltm.Candidate(
-        algorithm=params.algorithm,
-        invert=params.invert,
-        threshold=params.threshold,
-        contrast=params.contrast,
-        brightness=params.brightness,
-        gamma=params.gamma,
-        autocontrast=params.autocontrast,
-        sharpen=params.sharpen,
-    )
-    t0 = time.perf_counter()
-    out = ltm.render_candidate(base_gray, cand)
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    quality_mode = (params.quality_mode or "fast").lower()
+    refine_debug: dict | None = None
+    if quality_mode == "best":
+        t0 = time.perf_counter()
+        out, refine_debug, winning_cand = _hq_refine(base_gray, params)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        # Reportar los params reales que ganaron
+        winning_algorithm = winning_cand.algorithm
+        winning_threshold = winning_cand.threshold
+    else:
+        cand = ltm.Candidate(
+            algorithm=params.algorithm,
+            invert=params.invert,
+            threshold=params.threshold,
+            contrast=params.contrast,
+            brightness=params.brightness,
+            gamma=params.gamma,
+            autocontrast=params.autocontrast,
+            sharpen=params.sharpen,
+        )
+        t0 = time.perf_counter()
+        out = ltm.render_candidate(base_gray, cand)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        winning_algorithm = cand.algorithm
+        winning_threshold = cand.threshold
 
     meta = {
         "output_size": [int(out.shape[1]), int(out.shape[0])],
@@ -276,7 +372,12 @@ def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndar
         "spot_mm": profile.spot_mm if profile else None,
         "white_ratio": float((out == 255).mean()),
         "render_ms": elapsed_ms,
+        "quality_mode": quality_mode,
+        "winning_algorithm": winning_algorithm,
+        "winning_threshold": winning_threshold,
     }
+    if refine_debug:
+        meta["refine"] = refine_debug
     return out, meta
 
 
@@ -415,9 +516,16 @@ def _process_endpoint_body(image_bytes: bytes, params: ProcessParams) -> Respons
         "X-Sharpen-Radius-Px": f"{meta['resolved_sharpen_radius_px']:.3f}",
         "X-Material": meta["material"],
         "X-Preset-Applied": applied_preset,
-        "X-Algorithm": resolved_params.algorithm,
-        "Content-Disposition": f"attachment; filename=\"laser_ready_{resolved_params.algorithm}.png\"",
+        "X-Algorithm": meta.get("winning_algorithm", resolved_params.algorithm),
+        "X-Quality-Mode": meta.get("quality_mode", "fast"),
+        "Content-Disposition": f"attachment; filename=\"laser_ready_{meta.get('winning_algorithm', resolved_params.algorithm)}.png\"",
     }
+    if meta.get("refine"):
+        r = meta["refine"]
+        headers["X-Refine-Candidates"] = str(r["candidates_evaluated"])
+        headers["X-Refine-Best-Score"] = f"{r['best_score_v5']:.4f}"
+        headers["X-Refine-Improvement"] = f"{r['improvement_v5']:.4f}"
+        headers["X-Refine-Seconds"] = f"{r['refine_seconds']:.2f}"
     if detector_reason:
         # Solo encabezados ASCII; trimmear acentos en valores via repr no es ideal,
         # pero el cliente igual lo muestra como info. Encode-safe:
@@ -434,10 +542,15 @@ async def process(
     Procesa imagen con params JSON. Devuelve PNG 1-bit.
 
     Cuerpo: `multipart/form-data` con campo `image` (file) y `params_json` (string JSON).
+    Default quality_mode='best' (HQ refinement con sobol + v5 scoring).
     """
     import json
     try:
-        params = ProcessParams(**json.loads(params_json))
+        raw = json.loads(params_json)
+        # /api/process default a HQ best (a menos que el cliente especifique fast)
+        if "quality_mode" not in raw:
+            raw["quality_mode"] = "best"
+        params = ProcessParams(**raw)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"params_json invalido: {exc}") from exc
     return _process_endpoint_body(await image.read(), params)
@@ -448,11 +561,12 @@ async def preview(
     image: UploadFile = File(...),
     params_json: str = Form("{}"),
 ) -> Response:
-    """Igual a /api/process pero forzando max_side=400 para rapidez."""
+    """Igual a /api/process pero forzando max_side=400 + quality_mode=fast para rapidez."""
     import json
     try:
         raw = json.loads(params_json)
         raw["max_side"] = 400  # forzar preview rapido
+        raw["quality_mode"] = "fast"  # nunca HQ search en preview
         params = ProcessParams(**raw)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=f"params_json invalido: {exc}") from exc

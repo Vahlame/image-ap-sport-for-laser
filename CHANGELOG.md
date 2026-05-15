@@ -4,6 +4,55 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [1.2.0] — 2026-05-15
+
+### Agregado — máxima calidad por imagen
+- **HQ refinement automático en `/api/process`**: el endpoint full-res ahora corre
+  un sobol-search de 25 candidatos alrededor del preset elegido y selecciona el mejor
+  por **score v5 (no-reference)**. Tiempos: ~2-3 min/imagen full-res (113-181s en
+  CPU; mucho menos con CUDA en LPIPS).
+- **`quality_mode` en ProcessParams**: `'fast'` (1 render) o `'best'` (HQ search).
+  `/api/process` default `'best'`; `/api/preview` queda en `'fast'`.
+- Headers nuevos: `X-Refine-Candidates`, `X-Refine-Best-Score`, `X-Refine-Improvement`,
+  `X-Refine-Seconds`, `X-Quality-Mode` para que el cliente vea qué pasó.
+
+### Agregado — máquina Funsun 9060
+- **Nuevo `MaterialProfile`**: `acrylic_funsun_9060_back_engrave` (lente 2.5", spot
+  0.22mm, DPI MAX 115, focus 7mm) — la configuración real del usuario.
+- **Spot table** ampliado en `laser_physics.SPOT_SIZE_DEFAULTS_MM` con variantes
+  Funsun 9060 (2", 2.5", 4").
+- **Nuevo preset `photo_back_engrave`**: tuneado para foto sobre acrílico (Stucki
+  serpentine + threshold 95 + gamma 1.55 + autocontrast 3.5 + sharpen 130 + invert
+  para grabado positivo subject-as-frost). Reemplaza al `poster_back_engrave` para
+  fotos cuando el material es acrílico.
+
+### Cambiado
+- **Auto-detector más agresivo**: si `material` empieza con `"acrylic"`, TODAS las
+  fotos van a `photo_back_engrave` (no scene_dark/scene_bright que están tuneados
+  para madera). Reglas de extreme_ratio/edge_density para gráficos siguen como antes.
+- `/api/process` default cambió de `fast` → `best`. Para mantener el comportamiento
+  anterior pasar `quality_mode: "fast"` en `params_json`.
+
+### Agregado — instalador profesional
+- **`Setup_LaserApp.bat`**: bootstrap completo (winget instala Python+Node si faltan,
+  crea venv, pip install, npm build, crea shortcut en Escritorio).
+- **`installer/LaserApp.iss`**: script Inno Setup 6 para compilar `.exe` profesional
+  con UI estándar (asistente con licencia GPL-3, carpeta destino, accesos directos,
+  desinstalador en Panel de Control).
+- **`installer/README.md`**: instrucciones para compilar el `.exe`.
+- **`installer/Output/ImageAPLaser_Setup_v1.2.0.exe`** (6.5 MB) compilado y listo
+  para distribuir como release asset.
+
+### Cambiado — repo público
+- Visibility: PRIVATE → **PUBLIC** en GitHub. Cualquiera puede clonar/ver/contribuir.
+
+### Validación
+- 47+ tests passing (`pytest -m "not network"`).
+- 5 imágenes stock procesadas con HQ + Funsun 9060 profile: cada una muestra
+  refine improvement v5 entre 0.0018 y 0.0106 (mejora real medible).
+- Rally car Subaru procesado: PNG con halftone definido (no la "mush" del grabado
+  previo que motivó esta release).
+
 ## [1.1.0] — 2026-05-15
 
 ### Agregado
