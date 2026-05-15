@@ -45,6 +45,7 @@ import laser_target_match as ltm
 import laser_scoring
 import laser_physics
 import laser_simulator
+import laser_presets
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -65,6 +66,11 @@ except ImportError as exc:
 class ProcessParams(BaseModel):
     """Parametros del pipeline. Defaults sensatos para acrilico back-engrave."""
 
+    preset: str = Field(
+        default="",
+        description="Si se pasa nombre de preset (e.g. 'photo_general', 'auto'), aplica esos "
+        "params como base; campos explicitos en este JSON SOBREESCRIBEN el preset."
+    )
     material: str = Field(default="", description="Nombre MaterialProfile o vacio")
     output_mm_short: float = Field(default=0.0, ge=0, description="Lado corto fisico en mm (0=no escalar USM)")
     output_dpi: int = Field(default=0, ge=0, le=2400, description="DPI del grabado final (0=no aplicar)")
@@ -159,6 +165,55 @@ def _resolve_sharpen_radius(
         output_dpi=int(output_dpi),
         radius_mm=float(radius_mm),
     )
+
+
+def _resolve_preset_overrides(params: ProcessParams, img_rgb: Image.Image) -> tuple[ProcessParams, str, str]:
+    """
+    Si params.preset != '', aplica el preset como base y respeta los campos del request
+    como overrides explícitos.
+
+    Convención: si en `params` un campo coincide con el DEFAULT del schema, se considera
+    "no especificado por el usuario" y se reemplaza por el del preset. Si el usuario
+    cambió ese campo, su valor manda.
+
+    Si preset == 'auto', corre el detector sobre la imagen y elige.
+
+    Returns: (params_efectivos, preset_name_aplicado, motivo_recomendacion)
+    """
+    preset_name = (params.preset or "").strip().lower()
+    if not preset_name:
+        return params, "", ""
+
+    detector_reason = ""
+    if preset_name == "auto":
+        rgb_arr = np.array(img_rgb.convert("RGB"))
+        rec = laser_presets.recommend_preset(rgb_arr)
+        preset_name = rec.preset_name
+        detector_reason = rec.reason
+
+    try:
+        preset = laser_presets.get_preset(preset_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Defaults del schema para detectar "no tocado por usuario"
+    defaults = ProcessParams().model_dump()
+    user_dump = params.model_dump()
+    preset_params = preset.as_param_dict()
+
+    merged = dict(user_dump)
+    for key, preset_val in preset_params.items():
+        if key not in user_dump:
+            continue
+        # Si el usuario dejó el default, usar el del preset
+        if user_dump[key] == defaults[key]:
+            merged[key] = preset_val
+
+    # Material: si el preset lo sugiere y el usuario no especificó, usarlo
+    if not user_dump.get("material") and preset.suggested_material:
+        merged["material"] = preset.suggested_material
+
+    return ProcessParams(**merged), preset_name, detector_reason
 
 
 def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndarray, dict]:
@@ -302,6 +357,32 @@ def list_materials() -> list[MaterialInfo]:
     return results
 
 
+@app.get("/api/presets")
+def list_presets() -> list[dict]:
+    """Catalogo de presets curados para que el wizard los muestre."""
+    return laser_presets.list_presets_dict()
+
+
+@app.post("/api/recommend_preset")
+async def recommend_preset_endpoint(image: UploadFile = File(...)) -> dict:
+    """Analiza la imagen y devuelve el preset recomendado + estadisticos + motivo."""
+    img_bytes = await image.read()
+    img = _load_image_from_bytes(img_bytes)
+    rgb_arr = np.array(img.convert("RGB"))
+    rec = laser_presets.recommend_preset(rgb_arr)
+    return {
+        "preset_name": rec.preset_name,
+        "preset_label": rec.preset_label,
+        "reason": rec.reason,
+        "stats": {
+            "mean": rec.stats.mean,
+            "std": rec.stats.std,
+            "extreme_ratio": rec.stats.extreme_ratio,
+            "edge_density": rec.stats.edge_density,
+        },
+    }
+
+
 @app.get("/api/algorithms", response_model=list[AlgorithmGroup])
 def list_algorithms() -> list[AlgorithmGroup]:
     """Devuelve algoritmos agrupados por familia para que el wizard pueda mostrar select coherente."""
@@ -320,7 +401,9 @@ def list_algorithms() -> list[AlgorithmGroup]:
 
 def _process_endpoint_body(image_bytes: bytes, params: ProcessParams) -> Response:
     img = _load_image_from_bytes(image_bytes)
-    out, meta = _process_image(img, params)
+    # Resolver preset (incluye auto-deteccion si preset=='auto')
+    resolved_params, applied_preset, detector_reason = _resolve_preset_overrides(params, img)
+    out, meta = _process_image(img, resolved_params)
     buf = io.BytesIO()
     Image.fromarray(out, mode="L").save(buf, format="PNG", optimize=True)
     buf.seek(0)
@@ -331,8 +414,14 @@ def _process_endpoint_body(image_bytes: bytes, params: ProcessParams) -> Respons
         "X-White-Ratio": f"{meta['white_ratio']:.4f}",
         "X-Sharpen-Radius-Px": f"{meta['resolved_sharpen_radius_px']:.3f}",
         "X-Material": meta["material"],
-        "Content-Disposition": f"attachment; filename=\"laser_ready_{params.algorithm}.png\"",
+        "X-Preset-Applied": applied_preset,
+        "X-Algorithm": resolved_params.algorithm,
+        "Content-Disposition": f"attachment; filename=\"laser_ready_{resolved_params.algorithm}.png\"",
     }
+    if detector_reason:
+        # Solo encabezados ASCII; trimmear acentos en valores via repr no es ideal,
+        # pero el cliente igual lo muestra como info. Encode-safe:
+        headers["X-Preset-Reason"] = detector_reason.encode("ascii", "ignore").decode("ascii")
     return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
 
 

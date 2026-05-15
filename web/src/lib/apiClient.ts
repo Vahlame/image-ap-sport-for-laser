@@ -14,6 +14,7 @@
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string | undefined) ?? 'http://127.0.0.1:18765';
 
 export interface ProcessParams {
+	preset: string;
 	material: string;
 	output_mm_short: number;
 	output_dpi: number;
@@ -30,26 +31,30 @@ export interface ProcessParams {
 	max_side: number;
 }
 
+/** Defaults seguros: el servidor aplica preset=='auto' por encima cuando se pasa. */
 export const DEFAULT_PARAMS: ProcessParams = {
+	preset: 'auto',
 	material: '',
 	output_mm_short: 0,
 	output_dpi: 0,
-	algorithm: 'floyd',
-	threshold: 83,
-	contrast: 0.55,
-	brightness: 25.0,
-	gamma: 1.35,
-	autocontrast: 0.0,
-	sharpen: 40.0,
+	algorithm: 'jarvis_serpentine',
+	threshold: 128,
+	contrast: 1.15,
+	brightness: 0.0,
+	gamma: 1.0,
+	autocontrast: 1.5,
+	sharpen: 70.0,
 	sharpen_radius_mm: 0.1,
 	invert: true,
 	preprocess_mode: 'sauvola',
 	max_side: 0
 };
 
-/** Preset: alta calidad agricultor (validado experimentalmente Sesion 3). */
+/** Preset legacy: alta calidad agricultor (validado experimentalmente Sesion 3).
+ *  Equivalente al preset 'poster_back_engrave' del backend. */
 export const PRESET_AGRICULTOR_HIGH_CONTRAST: ProcessParams = {
 	...DEFAULT_PARAMS,
+	preset: 'poster_back_engrave',
 	algorithm: 'floyd',
 	threshold: 75,
 	contrast: 1.0,
@@ -60,6 +65,26 @@ export const PRESET_AGRICULTOR_HIGH_CONTRAST: ProcessParams = {
 	invert: true,
 	preprocess_mode: 'sauvola'
 };
+
+export interface PresetInfo {
+	name: string;
+	label: string;
+	description: string;
+	params: Record<string, unknown>;
+	suggested_material: string;
+}
+
+export interface RecommendationResult {
+	preset_name: string;
+	preset_label: string;
+	reason: string;
+	stats: {
+		mean: number;
+		std: number;
+		extreme_ratio: number;
+		edge_density: number;
+	};
+}
 
 export interface HealthResponse {
 	status: string;
@@ -127,6 +152,21 @@ export const apiClient = {
 
 	async algorithms(): Promise<AlgorithmGroup[]> {
 		return fetchJson<AlgorithmGroup[]>('/api/algorithms');
+	},
+
+	async presets(): Promise<PresetInfo[]> {
+		return fetchJson<PresetInfo[]>('/api/presets');
+	},
+
+	async recommendPreset(imageBlob: Blob): Promise<RecommendationResult> {
+		const form = new FormData();
+		form.append('image', imageBlob, 'input.jpg');
+		const res = await fetch(`${API_BASE_URL}/api/recommend_preset`, { method: 'POST', body: form });
+		if (!res.ok) {
+			const detail = await res.text().catch(() => res.statusText);
+			throw new ApiError(res.status, detail);
+		}
+		return res.json() as Promise<RecommendationResult>;
 	},
 
 	/**

@@ -4,6 +4,52 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [1.1.0] — 2026-05-15
+
+### Agregado
+- **Sistema de presets curados** (`scripts/laser_presets.py`): 6 presets validados
+  experimentalmente con stock diverso (`photo_general`, `portrait`, `scene_dark`,
+  `scene_bright`, `poster_back_engrave`, `line_art`). Cada preset trae un conjunto
+  coherente de params + material sugerido.
+- **Auto-detector** `recommend_preset(rgb)`: analiza estadísticos básicos
+  (luminancia media, std, ratio bimodal, densidad de bordes) y elige el preset
+  adecuado para la imagen subida. Sin ML — heurísticos rápidos sobre histograma.
+- **Endpoints API**:
+  - `GET /api/presets` — catálogo de presets para el wizard.
+  - `POST /api/recommend_preset` — analiza la imagen y devuelve preset + razón.
+- **`ProcessParams.preset`**: nuevo campo. Si se pasa nombre de preset (o `auto`),
+  el server aplica esos params como base; campos explícitos del request
+  **sobreescriben** el preset.
+- **Default del wizard cambia a `preset='auto'`**: cada imagen sale con acabado
+  adecuado por defecto sin que el operador tenga que tunear.
+- **Polaridad correcta para grabado positivo**: los presets de foto ahora usan
+  `invert=True` para que el sujeto oscuro de la foto se grabe oscuro en madera
+  (positivo), en vez de quedar como negativo.
+
+### Cambiado
+- **Licencia: MIT → GPL-3.0-or-later** (copyleft). Las contribuciones siguen siendo
+  bienvenidas, pero las versiones derivadas deben permanecer open-source bajo la
+  misma licencia y preservar los créditos.
+- README + CHANGELOG actualizados con tabla de presets y workflow auto.
+
+### Agregado (gobernanza)
+- [`AUTHORS.md`](AUTHORS.md) — registro de contribuyentes.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — guía de PR, setup, estilo, qué se acepta.
+
+### Validación
+- Auto-detector probado contra 5 imágenes stock diversas (perro, paisaje, retrato chica,
+  ola, persona en canoa) → cada una sale con acabado impecable y polaridad correcta.
+- 130+ tests verde (12 nuevos para presets, antes 115).
+
+### Diferido a v1.2+
+- WebSocket de progreso para sweeps largos.
+- PyInstaller .exe stand-alone (PyTorch hace el bundle pesado; primero hay que probar
+  el approach con un toy build).
+- Mejora del `spectral_radial_penalty` con high-pass previo (distinguir dither de
+  macro-estructura).
+- Calibración física por step-wedge con láser real del usuario (workflow listo;
+  esperando a que se ejecute físicamente).
+
 ## [1.0.0] — 2026-05-15
 
 Primera versión consolidada. Pipeline funcional verificado contra dos imágenes reales

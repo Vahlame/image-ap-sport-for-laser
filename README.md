@@ -5,10 +5,10 @@ Preparación de imágenes para grabado láser CO2. Convierte una foto a color en
 láser cableada (DPI cap por spot, LUT por material, sharpen escalado al output
 físico, simulación de grabado).
 
-![Status](https://img.shields.io/badge/status-v1.0.0-success)
-![Tests](https://img.shields.io/badge/tests-115%2F115-success)
+![Status](https://img.shields.io/badge/status-v1.1.0-success)
+![Tests](https://img.shields.io/badge/tests-130%2B%2F130%2B-success)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![License](https://img.shields.io/badge/license-MIT-blue)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ---
 
@@ -60,28 +60,32 @@ Abrí `http://127.0.0.1:18765/app/` (build static servido por FastAPI) o
 
 1. **Subir** — drag-drop una foto (PNG/JPG/WebP, hasta 8000×8000 px).
 2. **Recortar** — encuadre con `cropper.js`.
-3. **Ajustes** — preset óptimo o manual. Material, tamaño físico (mm), DPI, algoritmo
-   de dither, contrast/brightness/gamma/sharpen. Preview en vivo (~300 ms debounce).
-4. **Resultado full-res** — PNG 1-bit + simulación del grabado (cómo se verá
+3. **Ajustes** — el wizard usa **preset `auto`** por defecto: detecta el tipo de imagen
+   (foto general, retrato, escena oscura/clara, poster, line art) y aplica los params
+   adecuados. Si querés tunear, cambiá a `manual` y movés sliders. Preview en vivo
+   (~300 ms debounce).
+4. **Resultado full-res** — PNG 1-bit + **simulación del grabado** (cómo se verá
    fotografiado en acrílico frost o wood burn).
 5. **Descargar** — `laser_ready_<material>_<algoritmo>.png` + checklist pre-grabado
    (mirror back-engrave, interval `25.4/DPI`, Pass-Through, 9–12% potencia acrílico).
 
-Preset óptimo validado experimentalmente (sesión 4 de development):
+### Presets curados (v1.1.0+)
 
-| Param | Valor |
-|---|---|
-| Algoritmo | `floyd` |
-| Pre-procesado | `sauvola` |
-| Invertir | sí (para back-engrave acrílico) |
-| Umbral | 75 |
-| Contraste | 1.0 |
-| Brillo | +10 |
-| Gamma | 1.2 |
-| Autocontraste | 2.0 |
-| Sharpen | 60 % |
-| Material | `acrylic_back_engrave` |
-| Output mm corto / DPI | 100 mm / 169 DPI (ajustar a tu pieza) |
+El backend mantiene un catálogo de presets validados experimentalmente. El detector
+elige el mejor según estadísticos básicos de la imagen (luminancia media, contraste,
+distribución bimodal, densidad de bordes):
+
+| Preset | Cuándo se aplica | Algoritmo | Polaridad |
+|---|---|---|---|
+| **photo_general** | Foto natural balanceada (default fallback) | Jarvis serpentine | invertido (positive en madera) |
+| **portrait** | Cara/animal en primer plano | Stucki serpentine | invertido |
+| **scene_dark** | Foto oscura con highlights brillantes | Jarvis serpentine | normal (engraba highlights) |
+| **scene_bright** | Foto muy clara (cielo, nieve, blanco) | Jarvis serpentine | invertido |
+| **poster_back_engrave** | Gráfico bimodal alto contraste | Floyd + sauvola | invertido (frost sobre fondo oscuro) |
+| **line_art** | Líneas finas / texto / vector | Threshold sin dither | invertido |
+
+Si querés saltar el auto y elegir explícitamente, pasá `preset: <nombre>` en el JSON
+del request (o seleccionalo en el wizard).
 
 ---
 
@@ -187,7 +191,16 @@ runs/                      experimentos (gitignored)
 
 ## Licencia
 
-MIT. Ver [`LICENSE`](LICENSE).
+**GPL-3.0-or-later** (copyleft). Ver [`LICENSE`](LICENSE).
+
+En claro:
+
+- ✅ Podés usarlo, modificarlo y distribuirlo libremente, incluso comercialmente.
+- ✅ Podés contribuir vía PR (ver [`CONTRIBUTING.md`](CONTRIBUTING.md) y
+  añadirte en [`AUTHORS.md`](AUTHORS.md)).
+- 🔒 Si distribuís una versión modificada, **debe seguir siendo GPL-3.0**: no se permite
+  re-licenciarla bajo términos más restrictivos ni cerrarla source-closed.
+- 📝 Debés preservar los avisos de copyright y créditos de los autores.
 
 Las matemáticas de los algoritmos de dithering son dominio público (Floyd-Steinberg
 1976, Jarvis 1976, Stucki 1981, Atkinson 1986, Burkes 1988, Sierra 1989,

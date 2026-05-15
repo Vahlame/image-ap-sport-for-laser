@@ -1,8 +1,8 @@
 [project]
 name = "image-ap-sport-for-laser"
-version = "1.0.0"
-description = "Image-to-PNG laser preparation: wizard + FastAPI + CO2 physics-aware pipeline"
-license = { text = "MIT" }
+version = "1.1.0"
+description = "Image-to-PNG laser preparation: wizard + FastAPI + CO2 physics-aware pipeline + auto-presets"
+license = { text = "GPL-3.0-or-later" }
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
