@@ -1,95 +1,210 @@
-# image ap sport for laser
+# Image AP — Laser Image Prep
 
-Herramienta en desarrollo: preparación de imágenes para grabado láser (PNG).
+Preparación de imágenes para grabado láser CO2. Convierte una foto a color en un
+**PNG 1-bit listo para Pass-Through en LightBurn** (u otro CAM), con física del
+láser cableada (DPI cap por spot, LUT por material, sharpen escalado al output
+físico, simulación de grabado).
 
-## Pruebas con imágenes de stock públicas
+![Status](https://img.shields.io/badge/status-v1.0.0-success)
+![Tests](https://img.shields.io/badge/tests-115%2F115-success)
+![Python](https://img.shields.io/badge/python-3.11%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-Requieren red para la primera descarga (se reutiliza caché en el directorio temporal de la sesión de `pytest`).
+---
 
-```bash
-pip install -e ".[dev]"
-pytest tests/test_stock_images.py -v -m network
-```
+## ¿Qué hace?
 
-Sin red: `pytest -m "not network"` (omitirá las de stock si están marcadas; hoy las de stock están marcadas `network`).
+| Etapa | Qué hace |
+|---|---|
+| **Wizard web** (SvelteKit 5) | Subís foto → recortás → ajustes por material → preview en vivo → procesás full-res → simulás cómo se verá grabado → descargás PNG. |
+| **Pipeline Python** | Preprocess (sauvola/niblack/grabcut/sam2) → LUT material → dither (40+ algoritmos) → PNG 1-bit. |
+| **Scoring v1..v5** | Métricas para A/B entre params; v5 es **sin referencia** (HVS-MSE + spectral + tone post-LUT). |
+| **Física CO2** | Spot del haz ↔ DPI útil; sharpen radius escalado al output mm × DPI; LUT inversa por material para compensar dot-gain. |
+| **Calibración física** | Generador de step-wedge + fit de LUT desde foto del wedge grabado. |
+| **Simulación** | Forward model: blur del spot + respuesta tonal del material para predecir cómo se verá fotografiado el grabado. |
 
-## Barrido de parámetros (prueba y error offline)
+---
 
-Misma lógica de preview que la web (gris BT.601 + contraste + brillo + umbral), sobre **una** imagen, generando muchos PNG + una base **SQLite** + **JSONL** para ordenar y filtrar.
+## Quickstart (Windows)
 
-El modo por defecto es `smart`: no se queda atado a un solo umbral. Genera una escalera de umbrales neutra (`threshold_ladder`), suma anclas guiadas por histograma/Otsu (`histogram_anchor_grid`) y completa con variaciones estratificadas (`stratified_jitter`). Así podés comparar visualmente y consultar la BD por origen.
+### Doble-clic (recomendado)
 
-```bash
-pip install -e .
-python scripts/laser_parameter_sweep.py --input tu_foto.png --out runs/exp1 --n 300 --seed 7 --max-side 1024
-```
+1. Instalación una vez (Terminal PowerShell):
+   ```powershell
+   cd "C:\ruta\image ap sport for laser"
+   python -m venv .venv312
+   .\.venv312\Scripts\Activate.ps1
+   pip install -e ".[api,perceptual,dev]"
+   cd web; npm install; npm run build; cd ..
+   ```
+2. Doble-clic en **`Iniciar Laser App.bat`** → se abre el wizard en el navegador.
 
-Salida: `runs/exp1/sweep.sqlite`, `sweep_manifest.jsonl`, `sweep_0001.png` … Además genera `index.html` con miniaturas filtrables por estrategia, `thumbs/` con previews livianos y `contact_sheet.png` como hoja de contacto. Al final imprime candidatos con `white_ratio` cercano a 0.5 (solo heurística) y una muestra ordenada de la escalera de umbrales.
+### Manual (dos terminales)
 
-Consultas útiles:
+```powershell
+# Terminal A — backend
+.\.venv312\Scripts\Activate.ps1
+uvicorn scripts.api_server:app --host 127.0.0.1 --port 18765
 
-```bash
-sqlite3 runs/exp1/sweep.sqlite "SELECT threshold, white_ratio, output_file FROM runs WHERE source='threshold_ladder' ORDER BY threshold;"
-sqlite3 runs/exp1/sweep.sqlite "SELECT threshold, contrast, brightness, source, white_ratio, output_file FROM runs ORDER BY ABS(white_ratio - 0.5) LIMIT 12;"
-```
-
-Si querés el comportamiento anterior, usá `--mode stratified`.
-
-Por defecto la carpeta de salida se limpia de artefactos generados (`sweep_*.png`, SQLite, manifest, reporte) antes de crear un experimento nuevo. Para acumular en la misma base usá `--resume`.
-
-## Búsqueda contra imagen objetivo
-
-Para aproximar una salida de referencia (por ejemplo una imagen procesada por ImagR), usá `laser_target_match.py`. Prueba varios algoritmos (`threshold`, `bayer4/8`, `floyd`, `atkinson`, `jarvis`, `stucki`), mezclas con Bayer y pipelines multi-pasada (por ejemplo medios tonos con Floyd + sombras con Bayer, Bayer→Floyd, threshold→Jarvis). Guarda todos los PNG en una carpeta y ordena los mejores en `index.html`.
-
-### Historial y dashboard (meta)
-
-Ver `docs/META_SYSTEM.md`. Vista Streamlit opcional:
-
-```bash
-pip install -e ".[dashboard]"
-streamlit run scripts/dashboard.py
-```
-
-```bash
-python scripts/laser_target_match.py --input foto.png --target referencia.png --out runs/target_match --n 2000 --max-side 240 --top-report 300 --workers 4
-```
-
-Notas:
-
-- `--n` puede subir a miles; `--workers` paraleliza por procesos.
-- `--max-side` controla la resolución de ranking. Usá 200–400 para explorar miles rápido; luego re-renderizá pocos candidatos a mayor resolución.
-- `match.sqlite` permite consultar por score, algoritmo y parámetros; `index.html` muestra el top visible y `contact_sheet.png` resume los mejores.
-- GPU: CuPy puede ayudar a futuro en kernels vectorizados, pero Floyd/Jarvis/Stucki tienen dependencia secuencial por píxel. Para esta fase, multiprocessing acelera todos los algoritmos de forma más directa.
-
-Para comparar varias imágenes contra el mismo objetivo, usá el runner batch:
-
-```bash
-python scripts/laser_batch_match.py --target referencia.png --input img1.png --input img2.png --out runs/batch_match --n 800 --max-side 240 --workers 4
-```
-
-Salida: `runs/batch_match/index.html` con una tarjeta por imagen, subcarpetas por input, y `batch_summary.json` con el mejor candidato de cada corrida.
-
-### Variantes de entrada antes del dither
-
-Cuando el score se estanca, conviene buscar mejor crop, rotación y tono **antes** del dither final. `laser_input_variants.py` genera muchas variantes de entrada, las pre-rankea contra el target con densidad/bordes, guarda SQLite/JSONL/HTML y deja una carpeta lista para `laser_batch_match.py`.
-
-```bash
-python scripts/laser_input_variants.py --input foto.png --target referencia.png --out runs/input_variants --mode aggressive --limit 48 --score-max-side 260
-python scripts/laser_batch_match.py --target referencia.png --input-dir runs/input_variants --out runs/batch_variants --n 800 --max-side 240 --workers 4
-```
-
-Salida: `variants.sqlite`, `variants_manifest.jsonl`, `index.html`, `thumbs/` y `variant_*.png`. Esto mantiene cada intento visible y consultable sin mezclarlo con los resultados de dither.
-
-## Interfaz web (SvelteKit)
-
-Aplicación en la carpeta `web/`:
-
-```bash
+# Terminal B — wizard dev (opcional; sólo si querés hot-reload de la UI)
 cd web
-npm install
 npm run dev
 ```
 
-Abre la URL que muestra Vite (por defecto `http://localhost:5173`). Wizard en español: subir → **recorte con Cropper.js** → ajustes (mm, DPI, referencia dither) → comparador antes/después (preview local con umbral) → descarga PNG de preview.
+Abrí `http://127.0.0.1:18765/app/` (build static servido por FastAPI) o
+`http://localhost:5173` (modo dev SvelteKit).
 
-Build estático: `cd web && npm run build` → salida en `web/build/`.
+---
+
+## Workflow operador (5 pasos)
+
+1. **Subir** — drag-drop una foto (PNG/JPG/WebP, hasta 8000×8000 px).
+2. **Recortar** — encuadre con `cropper.js`.
+3. **Ajustes** — preset óptimo o manual. Material, tamaño físico (mm), DPI, algoritmo
+   de dither, contrast/brightness/gamma/sharpen. Preview en vivo (~300 ms debounce).
+4. **Resultado full-res** — PNG 1-bit + simulación del grabado (cómo se verá
+   fotografiado en acrílico frost o wood burn).
+5. **Descargar** — `laser_ready_<material>_<algoritmo>.png` + checklist pre-grabado
+   (mirror back-engrave, interval `25.4/DPI`, Pass-Through, 9–12% potencia acrílico).
+
+Preset óptimo validado experimentalmente (sesión 4 de development):
+
+| Param | Valor |
+|---|---|
+| Algoritmo | `floyd` |
+| Pre-procesado | `sauvola` |
+| Invertir | sí (para back-engrave acrílico) |
+| Umbral | 75 |
+| Contraste | 1.0 |
+| Brillo | +10 |
+| Gamma | 1.2 |
+| Autocontraste | 2.0 |
+| Sharpen | 60 % |
+| Material | `acrylic_back_engrave` |
+| Output mm corto / DPI | 100 mm / 169 DPI (ajustar a tu pieza) |
+
+---
+
+## CLI avanzado (investigación / sweeps)
+
+Para barridos masivos, refinaciones, calibración. Documentado completo en
+[`docs/USAGE.md`](docs/USAGE.md).
+
+```powershell
+# Single render con params concretos
+python scripts\laser_target_match.py `
+  --input foto.jpg --target referencia.png `
+  --out runs\manual --preprocess-mode sauvola --score-version v4 --luma bt709 `
+  --max-side 0 --n 1 --workers 1 `
+  --material acrylic_back_engrave `
+  --output-mm-short 100 --output-dpi 169 --sharpen-radius-mm 0.10
+
+# Generar tira step-wedge para calibrar tu Funsun
+python scripts\laser_calibration_wedge.py `
+  --out wedge_acrylic.png --material acrylic_back_engrave `
+  --steps 16 --square-mm 10 --dpi 169 --dither blue_noise_vac32
+
+# Tras grabar + fotografiar la tira, ajustar LUT
+python scripts\laser_calibration_fit.py `
+  --photo wedge_grabado.jpg `
+  --wedge-meta wedge_acrylic_meta.json `
+  --out presets\materials\acrylic_funsun_calibrated.npy
+```
+
+---
+
+## Endpoints REST
+
+`scripts/api_server.py` expone:
+
+- `GET  /api/health` — liveness + estado modelo LPIPS + CUDA.
+- `GET  /api/materials` — builtins (`acrylic_back_engrave`, `wood_generic`) + custom de
+  `presets/materials/`.
+- `GET  /api/algorithms` — 40+ algoritmos agrupados por familia.
+- `POST /api/preview` — multipart imagen + `params_json`, fuerza `max_side=400`.
+- `POST /api/process` — full-res, devuelve PNG 1-bit con headers (`X-Process-Time-Ms`,
+  `X-Output-Width`, `X-White-Ratio`, `X-Sharpen-Radius-Px`, `X-Material`).
+- `POST /api/simulate` — multipart imagen 1-bit + material → PNG simulado del grabado.
+
+Ejemplo desde Python:
+
+```python
+import requests, json
+with open('foto.jpg', 'rb') as f:
+    r = requests.post(
+        'http://127.0.0.1:18765/api/process',
+        files={'image': f},
+        data={'params_json': json.dumps({
+            'material': 'acrylic_back_engrave',
+            'algorithm': 'floyd', 'threshold': 75, 'contrast': 1.0,
+            'brightness': 10, 'gamma': 1.2, 'invert': True,
+            'preprocess_mode': 'sauvola',
+            'output_mm_short': 100, 'output_dpi': 169,
+        })}
+    )
+open('laser_ready.png', 'wb').write(r.content)
+```
+
+---
+
+## Arquitectura
+
+```
+web/                       SvelteKit 5 wizard (build static)
+  src/routes/+page.svelte  5-step wizard
+  src/lib/apiClient.ts     cliente HTTP tipado
+  src/lib/components/      CropStage.svelte (cropper.js)
+
+scripts/                   motor Python
+  api_server.py            FastAPI (port 18765 default)
+  laser_target_match.py    motor principal (40+ algos, 9 preprocess, scoring v1..v5)
+  laser_scoring.py         métricas v1..v5
+  laser_physics.py         MaterialProfile, DPI cap, scaled USM
+  laser_blue_noise.py      void-and-cluster Ulichney 1993
+  laser_calibration_wedge.py  generador step-wedge
+  laser_calibration_fit.py    fit LUT desde foto del wedge
+  laser_simulator.py       forward model (spot blur + apariencia material)
+  laser_runtime_env.py     LPIPS device, VRAM caps, HF token sync
+
+tests/                     pytest, 115+ tests
+assets/blue_noise_*.npy    matrices VAC cacheadas
+presets/materials/         JSONs de materiales calibrados (post-calibración)
+docs/                      USAGE.md, IMPROVEMENT_LOG.md, planes
+runs/                      experimentos (gitignored)
+```
+
+---
+
+## Estado del proyecto
+
+- **v1.0.0** (2026-05-15): primera versión funcional verificada con dos imágenes reales
+  (poster Agricultor: pixel-match 69.74% vs target ImagR; retrato Picsum: visualmente
+  excelente con Jarvis serpentine).
+- **115/115 tests passing** (`pytest -m "not network"`). `svelte-check` clean.
+- **CUDA opcional**: LPIPS acelera con GPU; sin CUDA cae a CPU automáticamente.
+
+---
+
+## Licencia
+
+MIT. Ver [`LICENSE`](LICENSE).
+
+Las matemáticas de los algoritmos de dithering son dominio público (Floyd-Steinberg
+1976, Jarvis 1976, Stucki 1981, Atkinson 1986, Burkes 1988, Sierra 1989,
+Ulichney void-and-cluster 1993). Implementación propia desde los papers; no se copió
+código propietario.
+
+---
+
+## Roadmap (más allá de v1.0)
+
+- **Calibración física real**: workflow listo, requiere que el usuario grabe el
+  step-wedge en su láser + fotografíe. Después la LUT custom queda permanente.
+- **WebSocket** para progreso de sweeps largos.
+- **Métricas perceptuales mejoradas**: `spectral_radial_penalty` con high-pass previo
+  para distinguir dither de macro-estructura.
+- **PyInstaller .exe**: empaquetado para distribución a operadores sin Python instalado
+  (hoy requiere venv + npm; el `.bat` los wrappea).
+
+Ver [`docs/IMPROVEMENT_LOG.md`](docs/IMPROVEMENT_LOG.md) para historial técnico y
+[`docs/USAGE.md`](docs/USAGE.md) para guía operador completa.

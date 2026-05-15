@@ -1,7 +1,8 @@
 [project]
 name = "image-ap-sport-for-laser"
-version = "0.1.0"
-description = "Laser-ready image prep (PNG) — dev tooling"
+version = "1.0.0"
+description = "Image-to-PNG laser preparation: wizard + FastAPI + CO2 physics-aware pipeline"
+license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -26,9 +27,28 @@ dashboard = [
     "streamlit>=1.32.0",
 ]
 perceptual = [
+    "torch>=2.1.0,<3",
+    "torchvision>=0.16.0",
     "piq>=0.8.0",
     "lpips>=0.1.4",
 ]
+sam2 = [
+    "transformers>=4.46.0",
+    "accelerate>=0.34.0",
+]
+api = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "python-multipart>=0.0.9",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+# Sin paquete Python importable (solo scripts/); evita que setuptools descubra runs/, web/, reports/.
+[tool.setuptools]
+packages = []
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

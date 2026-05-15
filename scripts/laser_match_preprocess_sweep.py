@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import laser_runtime_env
+
 
 def split_counts(total: int, n_modes: int) -> list[int]:
     base = total // n_modes
@@ -50,6 +52,7 @@ def main() -> int:
     )
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+    laser_runtime_env.apply_lpips_default_process_env()
 
     repo = Path(__file__).resolve().parents[1]
     match_py = repo / "scripts" / "laser_target_match.py"
@@ -119,7 +122,7 @@ def main() -> int:
             continue
 
         sub.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run(cmd, cwd=str(repo))
+        r = subprocess.run(cmd, cwd=str(repo), env=laser_runtime_env.child_process_env())
         if r.returncode != 0:
             err = f"[ERROR] modo={mode} exit={r.returncode}"
             print(err, file=sys.stderr)

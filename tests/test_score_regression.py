@@ -1,4 +1,4 @@
-"""Regresion ligera para scoring v2 y SSIM minimo en caso controlado."""
+"""Regresion ligera para scoring v2/v3/v4 y SSIM minimo en caso controlado."""
 
 from __future__ import annotations
 
@@ -32,6 +32,22 @@ def _load_laser_scoring():
     return mod
 
 
+def test_score_v3_snapshot_stable() -> None:
+    """v3 incluye SSIM suavizado vs binario; semilla fija para detectar regresiones."""
+    lt = _load_laser_target_match()
+    laser_scoring = _load_laser_scoring()
+    cand = lt.Candidate("floyd", False, 128, 1.0, 0.0, 1.0, 0.0, 0.0)
+    rng = np.random.default_rng(12345)
+    target_gray = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    target_binary = np.where(target_gray >= 128, 255, 0).astype(np.uint8)
+    out = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    td = lt.density_map(target_gray)
+    te = lt.edge_map(target_gray)
+    s3 = laser_scoring.score_candidate_v3(out, target_gray, target_binary, td, te, cand)[0]
+    expected = 0.6174254319699772
+    assert s3 == pytest.approx(expected, rel=0.05, abs=0.02)
+
+
 def test_score_v2_snapshot_stable() -> None:
     """Semilla fija: el score v2 no debe moverse mas de ~5%% sin cambiar la formula."""
     lt = _load_laser_target_match()
@@ -48,9 +64,88 @@ def test_score_v2_snapshot_stable() -> None:
     assert s2 == pytest.approx(expected, rel=0.05, abs=0.02)
 
 
+def test_score_v4_finite_when_perceptual_installed() -> None:
+    """v4 requiere torch+lpips; primera corrida puede descargar pesos Alex (~233MB)."""
+    pytest.importorskip("torch")
+    pytest.importorskip("lpips")
+    lt = _load_laser_target_match()
+    laser_scoring = _load_laser_scoring()
+    cand = lt.Candidate("floyd", False, 128, 1.0, 0.0, 1.0, 0.0, 0.0)
+    rng = np.random.default_rng(12345)
+    target_gray = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    target_binary = np.where(target_gray >= 128, 255, 0).astype(np.uint8)
+    out = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    td = lt.density_map(target_gray)
+    te = lt.edge_map(target_gray)
+    s4 = laser_scoring.score_candidate_v4(out, target_gray, target_binary, td, te, cand)[0]
+    assert 0.05 < s4 < 1.5
+    assert np.isfinite(s4)
+
+
+def test_score_candidate_dispatch_matches_direct_v2_v3() -> None:
+    """El enrutador usado por laser_target_match debe coincidir con las funciones v2/v3."""
+    lt = _load_laser_target_match()
+    laser_scoring = _load_laser_scoring()
+    cand = lt.Candidate("floyd", False, 128, 1.0, 0.0, 1.0, 0.0, 0.0)
+    rng = np.random.default_rng(12345)
+    target_gray = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    target_binary = np.where(target_gray >= 128, 255, 0).astype(np.uint8)
+    out = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    td = lt.density_map(target_gray)
+    te = lt.edge_map(target_gray)
+
+    for version in ("v2", "v3"):
+        via_dispatch = laser_scoring.score_candidate_dispatch(
+            version, out, target_gray, target_binary, td, te, cand
+        )
+        if version == "v2":
+            direct = laser_scoring.score_candidate_v2(out, target_gray, target_binary, td, te, cand)
+        else:
+            direct = laser_scoring.score_candidate_v3(out, target_gray, target_binary, td, te, cand)
+        assert via_dispatch == direct
+
+
+def test_score_candidate_dispatch_v4_matches_direct_when_perceptual_installed() -> None:
+    pytest.importorskip("torch")
+    pytest.importorskip("lpips")
+    lt = _load_laser_target_match()
+    laser_scoring = _load_laser_scoring()
+    cand = lt.Candidate("floyd", False, 128, 1.0, 0.0, 1.0, 0.0, 0.0)
+    rng = np.random.default_rng(12345)
+    target_gray = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    target_binary = np.where(target_gray >= 128, 255, 0).astype(np.uint8)
+    out = rng.integers(0, 256, size=(40, 40), dtype=np.uint8)
+    td = lt.density_map(target_gray)
+    te = lt.edge_map(target_gray)
+    via_dispatch = laser_scoring.score_candidate_dispatch(
+        "v4", out, target_gray, target_binary, td, te, cand
+    )
+    direct = laser_scoring.score_candidate_v4(out, target_gray, target_binary, td, te, cand)
+    assert via_dispatch == direct
+
+
+def test_score_candidate_dispatch_errors() -> None:
+    """Version desconocida y v2/v3/v4 sin candidate deben fallar de forma explicita."""
+    laser_scoring = _load_laser_scoring()
+    lt = _load_laser_target_match()
+    cand = lt.Candidate("floyd", False, 128, 1.0, 0.0, 1.0, 0.0, 0.0)
+    rng = np.random.default_rng(1)
+    target_gray = rng.integers(0, 256, size=(16, 16), dtype=np.uint8)
+    target_binary = np.where(target_gray >= 128, 255, 0).astype(np.uint8)
+    out = rng.integers(0, 256, size=(16, 16), dtype=np.uint8)
+    td = lt.density_map(target_gray)
+    te = lt.edge_map(target_gray)
+
+    with pytest.raises(ValueError, match="desconocida"):
+        laser_scoring.score_candidate_dispatch("v0", out, target_gray, target_binary, td, te, cand)
+
+    for version in ("v2", "v3", "v4"):
+        with pytest.raises(ValueError, match="requiere candidate"):
+            laser_scoring.score_candidate_dispatch(version, out, target_gray, target_binary, td, te, None)
+
+
 def test_ssim_floor_identical_luminance() -> None:
     """Salida identica al target continuo: SSIM alto (proxy de best_match razonable)."""
-    lt = _load_laser_target_match()
     g = np.random.default_rng(7).integers(40, 200, size=(48, 48), dtype=np.uint8)
     out = g.copy()
     o = out.astype(np.float64) / 255.0

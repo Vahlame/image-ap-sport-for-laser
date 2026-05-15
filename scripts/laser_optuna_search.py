@@ -84,7 +84,7 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--max-side", type=int, default=240)
-    ap.add_argument("--score-version", choices=("v1", "v2"), default="v2")
+    ap.add_argument("--score-version", choices=("v1", "v2", "v3", "v4"), default="v2")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 

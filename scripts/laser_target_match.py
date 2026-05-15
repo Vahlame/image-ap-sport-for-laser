@@ -15,6 +15,12 @@ Salida:
 
 Exploración guiada (opcional): --guided-explore con dedupe por hash, plateau (ventana de std),
 reinicio perturbado y --batch-early-stop para lotes (p.ej. 20k) con checkpoints cada 5k.
+Con --refine-db el plateau queda OFF por defecto (menos spam y menos reinicios inútiles);
+tras muchas evals sin mejora se inyectan perturbaciones brutales (--refine-stagnation-inject-every, default 2200).
+Con n bajo, la ventana de plateau se acota automaticamente a ~n/2 para que el reinicio pueda disparar.
+Multiproceso: muchos workers duplican datos y en Windows la RAM puede subir; usa LASER_MATCH_MAX_WORKERS,
+--workers N o --worker-recycle-tasks (Py>=3.11, reinicia hijos cada N evaluaciones).
+Score v4 + CUDA: por defecto cap de workers y recycle=0 (LASER_V4_MAX_GPU_WORKERS); LPIPS en GPU con LASER_LPIPS_DEVICE=auto.
 
 Preprocesado (una ruta por corrida): none|sauvola|niblack|grabcut|watershed|chanvese|deeplab|unet|sam2.
 """
@@ -42,6 +48,11 @@ if str(_SCRIPT_DIR) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import laser_runtime_env
+
+laser_runtime_env.apply_lpips_default_process_env()
+laser_runtime_env.coerce_lpips_env_if_cuda_unavailable()
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 from scipy.ndimage import uniform_filter
@@ -49,6 +60,29 @@ from scipy.stats import qmc
 
 import laser_plateau
 import laser_scoring
+
+try:
+    import laser_physics
+except ImportError:
+    laser_physics = None  # type: ignore[assignment]
+
+try:
+    import laser_blue_noise
+except ImportError:
+    laser_blue_noise = None  # type: ignore[assignment]
+
+# Lazy-load void-and-cluster matrix 32x32 (Ulichney 1993) en primer uso (cache disco).
+_VAC_MATRIX_32: np.ndarray | None = None
+
+
+def _get_vac32() -> np.ndarray:
+    """Devuelve la matriz blue-noise VAC 32x32 normalizada en (0,1); cachea en memoria + disco."""
+    global _VAC_MATRIX_32
+    if _VAC_MATRIX_32 is None:
+        if laser_blue_noise is None:
+            raise RuntimeError("laser_blue_noise no disponible — algoritmo blue_noise_vac32 requiere el modulo")
+        _VAC_MATRIX_32 = laser_blue_noise.threshold_matrix_for_dithering(size=32)
+    return _VAC_MATRIX_32
 
 try:
     import numba
@@ -89,7 +123,18 @@ RESTART_ALGORITHMS = (
     "burkes_blue_mix",
     "two_pass_blue_then_sierra3",
     "blue_noise16",
+    "blue_noise_vac32",
     "bayer8",
+)
+
+BRUTAL_RESTART_ALGORITHMS = RESTART_ALGORITHMS + (
+    "jarvis_bayer8_edge_mix",
+    "stucki_bayer8_mix",
+    "floyd_bayer8_mix",
+    "sierra3_blue_mix",
+    "two_pass_threshold_then_jarvis",
+    "atkinson_bayer8_edge_mix",
+    "two_pass_bayer_then_floyd",
 )
 
 
@@ -189,6 +234,10 @@ _WORK_TARGET_BINARY: np.ndarray | None = None
 _WORK_TARGET_DENSITY: np.ndarray | None = None
 _WORK_TARGET_EDGES: np.ndarray | None = None
 _WORK_SCORE_VERSION: str = "v1"
+# Globals adicionales (R1b + R3): perceptual ppd para v5, sharpen radius escalado al output.
+# Defaults preservan comportamiento previo (ppd=64, radius=1.2) si no se pasan flags.
+_WORK_PPD: float = 64.0
+_WORK_SHARPEN_RADIUS: float = 1.2
 
 
 @dataclass(frozen=True)
@@ -243,6 +292,8 @@ def init_worker(
     target_density: np.ndarray,
     target_edges: np.ndarray,
     score_version: str = "v1",
+    ppd: float = 64.0,
+    sharpen_radius: float = 1.2,
 ) -> None:
     global _WORK_BASE_GRAY
     global _WORK_TARGET_GRAY
@@ -250,17 +301,140 @@ def init_worker(
     global _WORK_TARGET_DENSITY
     global _WORK_TARGET_EDGES
     global _WORK_SCORE_VERSION
+    global _WORK_PPD
+    global _WORK_SHARPEN_RADIUS
     _WORK_BASE_GRAY = base_gray
     _WORK_TARGET_GRAY = target_gray
     _WORK_TARGET_BINARY = target_binary
     _WORK_TARGET_DENSITY = target_density
     _WORK_TARGET_EDGES = target_edges
     _WORK_SCORE_VERSION = str(score_version)
+    _WORK_PPD = float(ppd)
+    _WORK_SHARPEN_RADIUS = float(sharpen_radius)
+
+
+def clear_main_worker_arrays() -> None:
+    """Libera copias globales del proceso principal (solo uso diagnostic/workers)."""
+    global _WORK_BASE_GRAY, _WORK_TARGET_GRAY, _WORK_TARGET_BINARY, _WORK_TARGET_DENSITY, _WORK_TARGET_EDGES
+    _WORK_BASE_GRAY = None
+    _WORK_TARGET_GRAY = None
+    _WORK_TARGET_BINARY = None
+    _WORK_TARGET_DENSITY = None
+    _WORK_TARGET_EDGES = None
+
+
+def _materialize_torch_device_args(args: argparse.Namespace) -> None:
+    """Resuelve --*-device auto a cpu|cuda antes de preprocesado PyTorch (sync con Cursor 2026-05-15)."""
+    for attr, flag in (
+        ("deeplab_device", "deeplab-device"),
+        ("unet_device", "unet-device"),
+        ("sam2_device", "sam2-device"),
+    ):
+        if not hasattr(args, attr):
+            continue
+        if getattr(args, attr) != "auto":
+            continue
+        try:
+            resolved = laser_runtime_env.resolve_torch_device_flag("auto")
+        except AttributeError:
+            # laser_runtime_env viejo sin resolve_torch_device_flag
+            return
+        setattr(args, attr, resolved)
+        print(f"[CONFIG] --{flag} auto -> {resolved}", flush=True)
+
+
+def create_match_executor(
+    max_workers: int,
+    *,
+    recycle_every: int,
+    initializer,
+    initargs: tuple,
+) -> ProcessPoolExecutor:
+    """
+    Pool para evaluaciones; opcionalmente recicla hijos (Python 3.11+) para reducir RAM acumulada en Windows.
+    """
+    if recycle_every > 0 and sys.version_info >= (3, 11):
+        return ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=initializer,
+            initargs=initargs,
+            max_tasks_per_child=int(recycle_every),
+        )
+    return ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=initializer,
+        initargs=initargs,
+    )
 
 
 def default_worker_count() -> int:
-    """Usa todos los núcleos lógicos disponibles (sin cap artificial)."""
-    return max(1, os.cpu_count() or 2)
+    """Nucleos logicos; opcional cap con env LASER_MATCH_MAX_WORKERS (entero)."""
+    cpu = max(1, os.cpu_count() or 2)
+    raw = os.environ.get("LASER_MATCH_MAX_WORKERS", "").strip()
+    if raw.isdigit():
+        return max(1, min(cpu, int(raw)))
+    return cpu
+
+
+def _configure_score_v4_cuda_efficiency(args: argparse.Namespace) -> None:
+    """
+    v4 + LPIPS: cada proceso hijo carga Alex en GPU; muchos workers compiten y suelen ir más lentos.
+    Por defecto limita workers y desactiva recycle de hijos (recargar LPIPS es caro).
+    """
+    if str(args.score_version) != "v4":
+        return
+    try:
+        import torch
+    except ImportError:
+        return
+    try:
+        mode = laser_runtime_env.lpips_device_mode()
+    except ValueError as exc:
+        print(f"[CONFIG] score v4: entorno LPIPS invalido: {exc}", flush=True)
+        return
+    force_cpu = mode == "cpu"
+    use_cuda = not force_cpu and torch.cuda.is_available()
+    if use_cuda:
+        dev_name = torch.cuda.get_device_name(0)
+        print(
+            f"[CONFIG] score v4: LPIPS en CUDA ({dev_name}); LASER_LPIPS_DEVICE={mode}",
+            flush=True,
+        )
+    elif force_cpu:
+        print("[CONFIG] score v4: LPIPS en CPU (LASER_LPIPS_DEVICE=cpu)", flush=True)
+    else:
+        print("[CONFIG] score v4: LPIPS en CPU (torch sin CUDA; modo auto->CPU)", flush=True)
+
+    if not use_cuda:
+        return
+
+    cap_raw = os.environ.get("LASER_V4_MAX_GPU_WORKERS", "").strip()
+    gpu_cap = max(1, int(cap_raw)) if cap_raw.isdigit() else 2
+
+    requested = args.workers if args.workers > 0 else default_worker_count()
+    workers_explicit = "--workers" in sys.argv and args.workers > 0
+
+    if requested > gpu_cap and not workers_explicit:
+        args.workers = gpu_cap
+        print(
+            f"[INFO] v4+CUDA: workers={gpu_cap} (antes {requested}); varios procesos duplican LPIPS en VRAM. "
+            "Más workers rarely más rápido. Override: --workers N o LASER_V4_MAX_GPU_WORKERS.",
+            flush=True,
+        )
+    elif requested > gpu_cap and workers_explicit:
+        print(
+            f"[WARN] v4+CUDA: --workers={requested} suele competir en GPU vs ≤{gpu_cap}; "
+            "si va lento, prueba menos workers.",
+            flush=True,
+        )
+
+    recycle_explicit = "--worker-recycle-tasks" in sys.argv
+    if args.worker_recycle_tasks > 0 and not recycle_explicit:
+        args.worker_recycle_tasks = 0
+        print(
+            "[INFO] v4+CUDA: worker-recycle-tasks=0 (reciclar procesos recarga LPIPS -> muy lento)",
+            flush=True,
+        )
 
 
 def parallel_chunksize(num_tasks: int, worker_count: int) -> int:
@@ -289,6 +463,7 @@ def evaluate_candidate_task(task: tuple[int, Candidate]) -> tuple[int, Candidate
         _WORK_TARGET_DENSITY,
         _WORK_TARGET_EDGES,
         candidate,
+        ppd=_WORK_PPD,
     )
     elapsed = time.perf_counter() - t0
     return idx, candidate, output, score, pixel_error, edge_error, white_ratio, elapsed
@@ -324,32 +499,61 @@ def dedupe_candidates_by_hash(candidates: list[Candidate]) -> tuple[list[Candida
     return out, skipped
 
 
+def sort_candidates_threshold_proximity(
+    candidates: list[Candidate],
+    base_gray: np.ndarray,
+    target_white_ratio: float,
+) -> list[Candidate]:
+    """
+    Orden estable: umbrales mas cercanos al centro Otsu/cuantil (input) primero.
+    Suele mejorar el mejor score alcanzado en pocas evaluaciones (orden FIFO guiado).
+    """
+    otsu = int(otsu_threshold(base_gray))
+    q_thr = int(np.clip(np.quantile(base_gray, 1.0 - float(target_white_ratio)), 1, 254))
+    mid = int(round((otsu + q_thr) / 2))
+
+    def sort_key(c: Candidate) -> tuple[int, int, int, str]:
+        t = int(c.threshold)
+        return (abs(t - mid), abs(t - otsu), abs(t - q_thr), c.algorithm)
+
+    return sorted(candidates, key=sort_key)
+
+
 def perturb_candidates_restart(
     base_gray: np.ndarray,
     target_white_ratio: float,
     count: int,
     rng: np.random.Generator,
     anchor: Candidate | None,
+    *,
+    brutal: bool = False,
 ) -> list[Candidate]:
     """Genera candidatos aleatorios alrededor de un ancla para reinicio tras plateau."""
     otsu = int(otsu_threshold(base_gray))
     quantile_threshold = int(np.clip(np.quantile(base_gray, 1.0 - target_white_ratio), 1, 254))
     center = float(anchor.threshold) if anchor is not None else float((otsu + quantile_threshold) / 2.0)
+    thr_sigma = 22.0 if brutal else 14.0
+    algo_pool = BRUTAL_RESTART_ALGORITHMS if brutal else RESTART_ALGORITHMS
+    contrast_pool = (0.48, 0.56, 0.62, 0.72, 0.82, 0.92, 1.05, 1.15, 1.28, 1.42) if brutal else (0.52, 0.62, 0.72, 0.82, 0.92, 1.05, 1.2)
+    bright_mu, bright_sigma = (18.0, 14.0) if brutal else (16.0, 10.0)
+    gamma_pool = (0.72, 0.82, 0.88, 0.96, 1.0, 1.08, 1.15, 1.22, 1.32) if brutal else (0.78, 0.88, 0.96, 1.0, 1.08, 1.18, 1.28)
+    sharpen_pool = (0.0, 35.0, 75.0, 115.0, 155.0) if brutal else (0.0, 40.0, 90.0, 140.0)
+    autocontrast_pool = (0.0, 1.0, 2.0, 3.0, 6.0, 8.0) if brutal else (1.0, 2.0, 3.0, 6.0)
     out: list[Candidate] = []
     attempts = 0
     max_attempts = max(count * 8, count + 50)
     while len(out) < count and attempts < max_attempts:
         attempts += 1
-        thr = int(np.clip(rng.normal(center, 14.0), 1, 254))
+        thr = int(np.clip(rng.normal(center, thr_sigma), 1, 254))
         cand = Candidate(
-            str(rng.choice(RESTART_ALGORITHMS)),
+            str(rng.choice(algo_pool)),
             bool(rng.integers(0, 2)),
             thr,
-            float(rng.choice((0.52, 0.62, 0.72, 0.82, 0.92, 1.05, 1.2))),
-            float(rng.normal(16.0, 10.0)),
-            float(rng.choice((0.78, 0.88, 0.96, 1.0, 1.08, 1.18, 1.28))),
-            float(rng.choice((1.0, 2.0, 3.0, 6.0))),
-            float(rng.choice((0.0, 40.0, 90.0, 140.0))),
+            float(rng.choice(contrast_pool)),
+            float(rng.normal(bright_mu, bright_sigma)),
+            float(rng.choice(gamma_pool)),
+            float(rng.choice(autocontrast_pool)),
+            float(rng.choice(sharpen_pool)),
         )
         out.append(cand)
     return out
@@ -361,10 +565,32 @@ def score_window_std(window: deque[float]) -> float:
     return float(np.std(np.array(window, dtype=np.float64), ddof=0))
 
 
+_GRAY_LUMA_STANDARD: str = "bt601"
+
+
+def set_gray_luma_standard(name: str) -> None:
+    """Pesos de luma para rgb_to_gray (BT.601 = comportamiento historico del repo)."""
+    global _GRAY_LUMA_STANDARD
+    if name not in ("bt601", "bt709"):
+        raise ValueError(f"luma desconocido: {name!r}")
+    _GRAY_LUMA_STANDARD = name
+
+
 def rgb_to_gray(rgb: np.ndarray) -> np.ndarray:
+    """
+    Luma sobre R'G'B' linealizado 0..255 (pesos BT.601 por defecto, compatible con codigo previo).
+
+    Args:
+        rgb: HxWx3 uint8 o floatable.
+
+    Returns:
+        HxW float64 en rango ~0..255.
+    """
     r = rgb[..., 0].astype(np.float64)
     g = rgb[..., 1].astype(np.float64)
     b = rgb[..., 2].astype(np.float64)
+    if _GRAY_LUMA_STANDARD == "bt709":
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
@@ -423,7 +649,10 @@ def preprocess_gray(base_gray: np.ndarray, candidate: Candidate) -> np.ndarray:
     gray = np.clip(gray, 0.0, 255.0)
     if candidate.sharpen > 0:
         image = Image.fromarray(gray.astype(np.uint8), mode="L")
-        image = image.filter(ImageFilter.UnsharpMask(radius=1.2, percent=int(candidate.sharpen), threshold=2))
+        # R3 (regla 3 RULES): radius proviene de _WORK_SHARPEN_RADIUS, escalado al output
+        # fisico (output_mm x output_dpi) si --output-mm-short/--output-dpi se pasaron en CLI;
+        # default 1.2 preserva comportamiento anterior.
+        image = image.filter(ImageFilter.UnsharpMask(radius=_WORK_SHARPEN_RADIUS, percent=int(candidate.sharpen), threshold=2))
         gray = np.array(image, dtype=np.float64)
     if candidate.invert:
         gray = 255.0 - gray
@@ -900,6 +1129,31 @@ BURKES_BLUE_VARIANTS: dict[str, tuple[float, float, float]] = {
     "burkes_blue_mix_tightmid": (62.0, 188.0, 72.0),
 }
 
+# Subcadenas de nombre de algoritmo para priorizar en preset --search-preset acrylic (halftone acrilico / CO2).
+_ACRYLIC_NAME_KEYS: tuple[str, ...] = (
+    "jarvis",
+    "stucki",
+    "sierra",
+    "burkes",
+    "two_pass",
+    "atkinson_bayer",
+    "floyd_bayer",
+    "stucki_bayer",
+)
+
+
+def _algorithm_prefers_acrylic(name: str) -> bool:
+    lower = name.lower()
+    return any(k in lower for k in _ACRYLIC_NAME_KEYS)
+
+
+def _acrylic_dense_order(base: tuple[str, ...]) -> tuple[str, ...]:
+    """Duplica la cola prioritaria para que el round-robin de la capa densa la visite ~2x mas."""
+    pri = [a for a in base if _algorithm_prefers_acrylic(a)]
+    rest = [a for a in base if a not in pri]
+    return tuple(pri * 2 + rest)
+
+
 # Familia acrylic / blue-noise + difusión y multi-pasada (lista larga; la rejilla densa reparte en round-robin).
 BLUE_DENSE_ALGOS: tuple[str, ...] = (
     "burkes_blue_mix",
@@ -920,6 +1174,7 @@ BLUE_DENSE_ALGOS: tuple[str, ...] = (
     "jarvis_serpentine",
     "stucki_serpentine",
     "blue_noise16",
+    "blue_noise_vac32",
     "sierra3_midtones_blue_extremes",
     "floyd_bayer8_mix",
     "jarvis_bayer8_edge_mix",
@@ -931,6 +1186,29 @@ BLUE_DENSE_ALGOS: tuple[str, ...] = (
     "two_pass_soft_edges_atkinson",
 )
 
+ACRYLIC_BLUE_DENSE_ALGOS: tuple[str, ...] = _acrylic_dense_order(BLUE_DENSE_ALGOS)
+
+
+def _clip_dense_thresholds(
+    thresholds: list[int],
+    thr_min: int | None,
+    thr_max: int | None,
+) -> list[int]:
+    """Recorta la lista de umbrales de la capa densa a [thr_min, thr_max] (inclusive)."""
+    if thr_min is None and thr_max is None:
+        return thresholds
+    lo = 1 if thr_min is None else max(1, int(thr_min))
+    hi = 254 if thr_max is None else min(254, int(thr_max))
+    if lo > hi:
+        return thresholds
+    clipped = [t for t in thresholds if lo <= t <= hi]
+    if len(clipped) >= 12:
+        return sorted(clipped)
+    mid = max(lo, min(hi, (lo + hi) // 2))
+    fill = {int(np.clip(mid + d, lo, hi)) for d in range(-14, 15, 1)}
+    merged = sorted({*clipped, *fill})
+    return merged if merged else thresholds
+
 
 def dense_blue_family_candidates(
     quantile_threshold: int,
@@ -938,6 +1216,9 @@ def dense_blue_family_candidates(
     cap: int,
     sampling: str = "sobol",
     seed: int = 42,
+    dense_threshold_min: int | None = None,
+    dense_threshold_max: int | None = None,
+    search_preset: str = "default",
 ) -> list[Candidate]:
     """Rejilla o muestra Sobol (6D + round-robin de algoritmo); `cap` nunca supera MAX_CANDIDATES_PER_RUN."""
     cap = min(MAX_CANDIDATES_PER_RUN, max(1, cap))
@@ -947,6 +1228,7 @@ def dense_blue_family_candidates(
         for delta in range(-28, 29, 2):
             thr_set.add(int(np.clip(center + delta, 1, 254)))
     thresholds = sorted(thr_set)
+    thresholds = _clip_dense_thresholds(thresholds, dense_threshold_min, dense_threshold_max)
 
     scale = max(40.0, float(cap) ** 0.34)
     n_thr = max(16, min(220, int(scale * 1.1)))
@@ -964,7 +1246,7 @@ def dense_blue_family_candidates(
     sharpens = (0.0, 40.0, 80.0, 120.0, 170.0)[: max(2, min(5, 2 + cap // 150_000))]
     inverts = (True, False) if cap >= 50_000 else (True,)
 
-    algorithms = BLUE_DENSE_ALGOS
+    algorithms = ACRYLIC_BLUE_DENSE_ALGOS if search_preset == "acrylic" else BLUE_DENSE_ALGOS
     out: list[Candidate] = []
     rr = 0
 
@@ -1153,215 +1435,179 @@ def _error_diffusion_python(
     return out
 
 
+# ---------------------------------------------------------------------------
+# R6 (refactor): renderers tabla + dispatch limpio
+# ---------------------------------------------------------------------------
+#
+# Antes: render_candidate tenia ~230 lineas de if/elif con kernels inline duplicados
+# (Floyd, Jarvis, Stucki, Atkinson aparecian 3-4 veces literales). Las 4 ramas finales
+# (floyd/atkinson/jarvis/stucki) eran codigo muerto: DIFFUSION_ALGORITHMS las cubre antes.
+#
+# Ahora: tres tablas + dispatch. Cada renderer toma (gray, candidate) y devuelve uint8.
+# Para agregar un algoritmo nuevo: anadir entrada en una de las tres tablas. Las listas
+# RESTART_ALGORITHMS, etc., pueden usar ALL_RENDER_ALGORITHMS para validacion.
+
+
+def _render_threshold(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    return np.where(gray >= candidate.threshold, 255, 0).astype(np.uint8)
+
+
+def _render_bayer4(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    return ordered_dither(gray, candidate.threshold, BAYER_4, strength=72.0)
+
+
+def _render_bayer8(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    return ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
+
+
+def _render_blue_noise16(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    return ordered_dither(gray, candidate.threshold, NOISE_16, strength=72.0)
+
+
+def _render_blue_noise_vac32(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    # Blue-noise autentico Ulichney 1993 (void-and-cluster) 32x32. Mejor perfil espectral
+    # que NOISE_16 ad-hoc: ~0 energia en baja frec -> sin clusters direccionales.
+    return ordered_dither(gray, candidate.threshold, _get_vac32(), strength=72.0)
+
+
+def _render_sierra3_blue_mix(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    sierra = error_diffusion(gray, candidate.threshold, SIERRA3_KERNEL, 32, serpentine=True)
+    blue = ordered_dither(gray, candidate.threshold, NOISE_16, strength=78.0)
+    return np.where(edge_map(gray) > 0.12, sierra, blue).astype(np.uint8)
+
+
+def _render_sierra3_midtones_blue_extremes(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    sierra = error_diffusion(gray, candidate.threshold, SIERRA3_KERNEL, 32, serpentine=True)
+    blue = ordered_dither(gray, candidate.threshold, NOISE_16, strength=92.0)
+    hard = np.where(gray >= candidate.threshold, 255, 0).astype(np.uint8)
+    extremes = shadow_mask(gray, 58.0) | highlight_mask(gray, 214.0)
+    return np.where(extremes, hard, np.where(midtone_mask(gray), sierra, blue)).astype(np.uint8)
+
+
+def _render_two_pass_blue_then_sierra3(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    textured = ordered_dither(gray, candidate.threshold, NOISE_16, strength=54.0).astype(np.float64)
+    blended = np.clip(gray * 0.74 + textured * 0.26, 0, 255)
+    return error_diffusion(blended, candidate.threshold, SIERRA3_KERNEL, 32, serpentine=True)
+
+
+def _render_floyd_bayer8_mix(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    floyd = error_diffusion(gray, candidate.threshold, FLOYD_KERNEL, 16)
+    bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
+    mask = edge_map(gray) > 0.18
+    return np.where(mask, floyd, bayer).astype(np.uint8)
+
+
+def _render_stucki_bayer8_mix(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    stucki = error_diffusion(gray, candidate.threshold, STUCKI_KERNEL, 42)
+    bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
+    mask = edge_map(gray) > 0.18
+    return np.where(mask, stucki, bayer).astype(np.uint8)
+
+
+def _render_jarvis_bayer8_edge_mix(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    jarvis = error_diffusion(gray, candidate.threshold, JARVIS_KERNEL, 48)
+    bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
+    return np.where(edge_map(gray) > 0.15, jarvis, bayer).astype(np.uint8)
+
+
+def _render_atkinson_bayer8_edge_mix(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    atkinson = error_diffusion(gray, candidate.threshold, ATKINSON_KERNEL, 8)
+    bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
+    return np.where(edge_map(gray) > 0.15, atkinson, bayer).astype(np.uint8)
+
+
+def _render_jarvis_midtones_threshold_extremes(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    jarvis = error_diffusion(gray, candidate.threshold, JARVIS_KERNEL, 48)
+    hard = np.where(gray >= candidate.threshold, 255, 0).astype(np.uint8)
+    return np.where(midtone_mask(gray), jarvis, hard).astype(np.uint8)
+
+
+def _render_floyd_midtones_bayer_shadows(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    floyd = error_diffusion(gray, candidate.threshold, FLOYD_KERNEL, 16)
+    bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=84.0)
+    return np.where(midtone_mask(gray), floyd, bayer).astype(np.uint8)
+
+
+def _render_atkinson_highlights_stucki_shadows(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    atkinson = error_diffusion(gray, candidate.threshold, ATKINSON_KERNEL, 8)
+    stucki = error_diffusion(gray, candidate.threshold, STUCKI_KERNEL, 42)
+    return np.where(highlight_mask(gray), atkinson, stucki).astype(np.uint8)
+
+
+def _render_two_pass_bayer_then_floyd(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    textured = ordered_dither(gray, candidate.threshold, BAYER_8, strength=48.0).astype(np.float64)
+    blended = np.clip(gray * 0.72 + textured * 0.28, 0, 255)
+    return error_diffusion(blended, candidate.threshold, FLOYD_KERNEL, 16)
+
+
+def _render_two_pass_threshold_then_jarvis(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    hard = np.where(gray >= candidate.threshold, 255.0, 0.0)
+    blended = np.clip(gray * 0.65 + hard * 0.35, 0, 255)
+    return error_diffusion(blended, candidate.threshold, JARVIS_KERNEL, 48)
+
+
+def _render_two_pass_soft_edges_atkinson(gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    edges = edge_map(gray)
+    softened = np.clip(gray + (edges - 0.5) * 42.0, 0, 255)
+    return error_diffusion(softened, candidate.threshold, ATKINSON_KERNEL, 8)
+
+
+# Tabla 1: renderers named (uno-a-uno por algoritmo)
+NAMED_RENDERERS: dict[str, "Callable[[np.ndarray, Candidate], np.ndarray]"] = {
+    "threshold": _render_threshold,
+    "bayer4": _render_bayer4,
+    "bayer8": _render_bayer8,
+    "blue_noise16": _render_blue_noise16,
+    "blue_noise_vac32": _render_blue_noise_vac32,
+    "sierra3_blue_mix": _render_sierra3_blue_mix,
+    "sierra3_midtones_blue_extremes": _render_sierra3_midtones_blue_extremes,
+    "two_pass_blue_then_sierra3": _render_two_pass_blue_then_sierra3,
+    "floyd_bayer8_mix": _render_floyd_bayer8_mix,
+    "stucki_bayer8_mix": _render_stucki_bayer8_mix,
+    "jarvis_bayer8_edge_mix": _render_jarvis_bayer8_edge_mix,
+    "atkinson_bayer8_edge_mix": _render_atkinson_bayer8_edge_mix,
+    "jarvis_midtones_threshold_extremes": _render_jarvis_midtones_threshold_extremes,
+    "floyd_midtones_bayer_shadows": _render_floyd_midtones_bayer_shadows,
+    "atkinson_highlights_stucki_shadows": _render_atkinson_highlights_stucki_shadows,
+    "two_pass_bayer_then_floyd": _render_two_pass_bayer_then_floyd,
+    "two_pass_threshold_then_jarvis": _render_two_pass_threshold_then_jarvis,
+    "two_pass_soft_edges_atkinson": _render_two_pass_soft_edges_atkinson,
+}
+
+
+def _all_render_algorithms() -> tuple[str, ...]:
+    """Conjunto unico de todos los algoritmos soportados (las 3 tablas combinadas)."""
+    return tuple(sorted({*NAMED_RENDERERS.keys(), *DIFFUSION_ALGORITHMS.keys(), *BURKES_BLUE_VARIANTS.keys()}))
+
+
+# Tupla exportada (computada una vez). Las listas RESTART_ALGORITHMS, build_candidates,
+# etc., pueden validarse contra esta o usarla directamente.
+ALL_RENDER_ALGORITHMS: tuple[str, ...] = _all_render_algorithms()
+
+
 def render_candidate(base_gray: np.ndarray, candidate: Candidate) -> np.ndarray:
+    """
+    Renderiza un candidato: preprocesa el gris + aplica el algoritmo de halftone.
+
+    Dispatch en 3 tablas (en orden de chequeo):
+      1. DIFFUSION_ALGORITHMS: floyd/jarvis/stucki/atkinson/burkes/sierra* (parametrico)
+      2. BURKES_BLUE_VARIANTS: 6 mezclas burkes-blue por banda midtone (parametrico)
+      3. NAMED_RENDERERS: 18 algoritmos singleton (threshold/bayer/blue-noise/mixes/multipass)
+    """
     gray = preprocess_gray(base_gray, candidate)
-    if candidate.algorithm == "threshold":
-        return np.where(gray >= candidate.threshold, 255, 0).astype(np.uint8)
-    if candidate.algorithm == "bayer4":
-        return ordered_dither(gray, candidate.threshold, BAYER_4, strength=72.0)
-    if candidate.algorithm == "bayer8":
-        return ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
-    if candidate.algorithm == "blue_noise16":
-        return ordered_dither(gray, candidate.threshold, NOISE_16, strength=72.0)
-    if candidate.algorithm in DIFFUSION_ALGORITHMS:
-        kernel, divisor, serpentine = DIFFUSION_ALGORITHMS[candidate.algorithm]
+    algo = candidate.algorithm
+    if algo in DIFFUSION_ALGORITHMS:
+        kernel, divisor, serpentine = DIFFUSION_ALGORITHMS[algo]
         return error_diffusion(gray, candidate.threshold, kernel, divisor, serpentine=serpentine)
-    if candidate.algorithm == "sierra3_blue_mix":
-        sierra = error_diffusion(gray, candidate.threshold, SIERRA3_KERNEL, 32, serpentine=True)
-        blue = ordered_dither(gray, candidate.threshold, NOISE_16, strength=78.0)
-        return np.where(edge_map(gray) > 0.12, sierra, blue).astype(np.uint8)
-    if candidate.algorithm in BURKES_BLUE_VARIANTS:
-        mid_lo, mid_hi, blue_strength = BURKES_BLUE_VARIANTS[candidate.algorithm]
+    if algo in BURKES_BLUE_VARIANTS:
+        mid_lo, mid_hi, blue_strength = BURKES_BLUE_VARIANTS[algo]
         burkes = error_diffusion(gray, candidate.threshold, BURKES_KERNEL, 32, serpentine=True)
         blue = ordered_dither(gray, candidate.threshold, NOISE_16, strength=blue_strength)
         return np.where((gray >= mid_lo) & (gray <= mid_hi), burkes, blue).astype(np.uint8)
-    if candidate.algorithm == "sierra3_midtones_blue_extremes":
-        sierra = error_diffusion(gray, candidate.threshold, SIERRA3_KERNEL, 32, serpentine=True)
-        blue = ordered_dither(gray, candidate.threshold, NOISE_16, strength=92.0)
-        hard = np.where(gray >= candidate.threshold, 255, 0).astype(np.uint8)
-        extremes = shadow_mask(gray, 58.0) | highlight_mask(gray, 214.0)
-        return np.where(extremes, hard, np.where(midtone_mask(gray), sierra, blue)).astype(np.uint8)
-    if candidate.algorithm == "two_pass_blue_then_sierra3":
-        textured = ordered_dither(gray, candidate.threshold, NOISE_16, strength=54.0).astype(np.float64)
-        blended = np.clip(gray * 0.74 + textured * 0.26, 0, 255)
-        return error_diffusion(blended, candidate.threshold, SIERRA3_KERNEL, 32, serpentine=True)
-    if candidate.algorithm == "floyd_bayer8_mix":
-        floyd = error_diffusion(gray, candidate.threshold, [(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)], 16)
-        bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
-        mask = edge_map(gray) > 0.18
-        return np.where(mask, floyd, bayer).astype(np.uint8)
-    if candidate.algorithm == "stucki_bayer8_mix":
-        stucki = error_diffusion(
-            gray,
-            candidate.threshold,
-            [
-                (1, 0, 8),
-                (2, 0, 4),
-                (-2, 1, 2),
-                (-1, 1, 4),
-                (0, 1, 8),
-                (1, 1, 4),
-                (2, 1, 2),
-                (-2, 2, 1),
-                (-1, 2, 2),
-                (0, 2, 4),
-                (1, 2, 2),
-                (2, 2, 1),
-            ],
-            42,
-        )
-        bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
-        mask = edge_map(gray) > 0.18
-        return np.where(mask, stucki, bayer).astype(np.uint8)
-    if candidate.algorithm == "jarvis_bayer8_edge_mix":
-        jarvis = error_diffusion(
-            gray,
-            candidate.threshold,
-            [
-                (1, 0, 7),
-                (2, 0, 5),
-                (-2, 1, 3),
-                (-1, 1, 5),
-                (0, 1, 7),
-                (1, 1, 5),
-                (2, 1, 3),
-                (-2, 2, 1),
-                (-1, 2, 3),
-                (0, 2, 5),
-                (1, 2, 3),
-                (2, 2, 1),
-            ],
-            48,
-        )
-        bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
-        return np.where(edge_map(gray) > 0.15, jarvis, bayer).astype(np.uint8)
-    if candidate.algorithm == "atkinson_bayer8_edge_mix":
-        atkinson = error_diffusion(gray, candidate.threshold, [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1), (1, 1, 1), (0, 2, 1)], 8)
-        bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=72.0)
-        return np.where(edge_map(gray) > 0.15, atkinson, bayer).astype(np.uint8)
-    if candidate.algorithm == "jarvis_midtones_threshold_extremes":
-        jarvis = error_diffusion(
-            gray,
-            candidate.threshold,
-            [
-                (1, 0, 7),
-                (2, 0, 5),
-                (-2, 1, 3),
-                (-1, 1, 5),
-                (0, 1, 7),
-                (1, 1, 5),
-                (2, 1, 3),
-                (-2, 2, 1),
-                (-1, 2, 3),
-                (0, 2, 5),
-                (1, 2, 3),
-                (2, 2, 1),
-            ],
-            48,
-        )
-        hard = np.where(gray >= candidate.threshold, 255, 0).astype(np.uint8)
-        return np.where(midtone_mask(gray), jarvis, hard).astype(np.uint8)
-    if candidate.algorithm == "floyd_midtones_bayer_shadows":
-        floyd = error_diffusion(gray, candidate.threshold, [(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)], 16)
-        bayer = ordered_dither(gray, candidate.threshold, BAYER_8, strength=84.0)
-        return np.where(midtone_mask(gray), floyd, bayer).astype(np.uint8)
-    if candidate.algorithm == "atkinson_highlights_stucki_shadows":
-        atkinson = error_diffusion(gray, candidate.threshold, [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1), (1, 1, 1), (0, 2, 1)], 8)
-        stucki = error_diffusion(
-            gray,
-            candidate.threshold,
-            [
-                (1, 0, 8),
-                (2, 0, 4),
-                (-2, 1, 2),
-                (-1, 1, 4),
-                (0, 1, 8),
-                (1, 1, 4),
-                (2, 1, 2),
-                (-2, 2, 1),
-                (-1, 2, 2),
-                (0, 2, 4),
-                (1, 2, 2),
-                (2, 2, 1),
-            ],
-            42,
-        )
-        return np.where(highlight_mask(gray), atkinson, stucki).astype(np.uint8)
-    if candidate.algorithm == "two_pass_bayer_then_floyd":
-        textured = ordered_dither(gray, candidate.threshold, BAYER_8, strength=48.0).astype(np.float64)
-        blended = np.clip(gray * 0.72 + textured * 0.28, 0, 255)
-        return error_diffusion(blended, candidate.threshold, [(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)], 16)
-    if candidate.algorithm == "two_pass_threshold_then_jarvis":
-        hard = np.where(gray >= candidate.threshold, 255.0, 0.0)
-        blended = np.clip(gray * 0.65 + hard * 0.35, 0, 255)
-        return error_diffusion(
-            blended,
-            candidate.threshold,
-            [
-                (1, 0, 7),
-                (2, 0, 5),
-                (-2, 1, 3),
-                (-1, 1, 5),
-                (0, 1, 7),
-                (1, 1, 5),
-                (2, 1, 3),
-                (-2, 2, 1),
-                (-1, 2, 3),
-                (0, 2, 5),
-                (1, 2, 3),
-                (2, 2, 1),
-            ],
-            48,
-        )
-    if candidate.algorithm == "two_pass_soft_edges_atkinson":
-        edges = edge_map(gray)
-        softened = np.clip(gray + (edges - 0.5) * 42.0, 0, 255)
-        return error_diffusion(softened, candidate.threshold, [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1), (1, 1, 1), (0, 2, 1)], 8)
-    if candidate.algorithm == "floyd":
-        return error_diffusion(gray, candidate.threshold, [(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)], 16)
-    if candidate.algorithm == "atkinson":
-        return error_diffusion(gray, candidate.threshold, [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1), (1, 1, 1), (0, 2, 1)], 8)
-    if candidate.algorithm == "jarvis":
-        return error_diffusion(
-            gray,
-            candidate.threshold,
-            [
-                (1, 0, 7),
-                (2, 0, 5),
-                (-2, 1, 3),
-                (-1, 1, 5),
-                (0, 1, 7),
-                (1, 1, 5),
-                (2, 1, 3),
-                (-2, 2, 1),
-                (-1, 2, 3),
-                (0, 2, 5),
-                (1, 2, 3),
-                (2, 2, 1),
-            ],
-            48,
-        )
-    if candidate.algorithm == "stucki":
-        return error_diffusion(
-            gray,
-            candidate.threshold,
-            [
-                (1, 0, 8),
-                (2, 0, 4),
-                (-2, 1, 2),
-                (-1, 1, 4),
-                (0, 1, 8),
-                (1, 1, 4),
-                (2, 1, 2),
-                (-2, 2, 1),
-                (-1, 2, 2),
-                (0, 2, 4),
-                (1, 2, 2),
-                (2, 2, 1),
-            ],
-            42,
-        )
-    raise ValueError(f"Algoritmo no soportado: {candidate.algorithm}")
+    fn = NAMED_RENDERERS.get(algo)
+    if fn is None:
+        raise ValueError(f"Algoritmo no soportado: {algo}")
+    return fn(gray, candidate)
 
 
 def edge_map(gray: np.ndarray) -> np.ndarray:
@@ -1397,6 +1643,9 @@ def build_candidates(
     limit: int,
     sampling: str = "sobol",
     sobol_seed: int = 42,
+    dense_threshold_min: int | None = None,
+    dense_threshold_max: int | None = None,
+    search_preset: str = "default",
 ) -> list[Candidate]:
     otsu = otsu_threshold(base_gray)
     quantile_threshold = int(np.clip(np.quantile(base_gray, 1.0 - target_white_ratio), 1, 254))
@@ -1412,6 +1661,7 @@ def build_candidates(
         "bayer4",
         "bayer8",
         "blue_noise16",
+        "blue_noise_vac32",
         "floyd",
         "floyd_serpentine",
         "atkinson",
@@ -1448,6 +1698,86 @@ def build_candidates(
         "two_pass_threshold_then_jarvis",
         "two_pass_soft_edges_atkinson",
     ]
+    aggressive_algorithms = [
+        "floyd",
+        "floyd_serpentine",
+        "atkinson",
+        "atkinson_serpentine",
+        "jarvis",
+        "jarvis_serpentine",
+        "stucki",
+        "stucki_serpentine",
+        "burkes",
+        "burkes_serpentine",
+        "sierra3",
+        "sierra3_serpentine",
+        "sierra2",
+        "sierra2_serpentine",
+        "sierra_lite",
+        "sierra_lite_serpentine",
+        "blue_noise16",
+        "blue_noise_vac32",
+        "sierra3_blue_mix",
+        "burkes_blue_mix",
+        "burkes_blue_mix_narrow",
+        "burkes_blue_mix_wide",
+        "burkes_blue_mix_softblue",
+        "burkes_blue_mix_hardblue",
+        "burkes_blue_mix_tightmid",
+        "sierra3_midtones_blue_extremes",
+        "two_pass_blue_then_sierra3",
+        "bayer8",
+        "floyd_bayer8_mix",
+        "stucki_bayer8_mix",
+        "jarvis_bayer8_edge_mix",
+        "atkinson_bayer8_edge_mix",
+        "jarvis_midtones_threshold_extremes",
+        "floyd_midtones_bayer_shadows",
+        "atkinson_highlights_stucki_shadows",
+        "two_pass_bayer_then_floyd",
+        "two_pass_threshold_then_jarvis",
+        "two_pass_soft_edges_atkinson",
+    ]
+    focused_algorithms = [
+        "floyd",
+        "floyd_serpentine",
+        "stucki",
+        "stucki_serpentine",
+        "jarvis",
+        "jarvis_serpentine",
+        "atkinson",
+        "atkinson_serpentine",
+        "burkes",
+        "burkes_serpentine",
+        "sierra3",
+        "sierra3_serpentine",
+        "sierra2",
+        "sierra2_serpentine",
+        "sierra_lite",
+        "sierra_lite_serpentine",
+        "blue_noise16",
+        "blue_noise_vac32",
+        "sierra3_blue_mix",
+        "burkes_blue_mix",
+        "burkes_blue_mix_narrow",
+        "burkes_blue_mix_wide",
+        "burkes_blue_mix_softblue",
+        "burkes_blue_mix_hardblue",
+        "burkes_blue_mix_tightmid",
+        "sierra3_midtones_blue_extremes",
+        "two_pass_blue_then_sierra3",
+        "floyd_bayer8_mix",
+        "stucki_bayer8_mix",
+        "jarvis_bayer8_edge_mix",
+        "atkinson_bayer8_edge_mix",
+        "jarvis_midtones_threshold_extremes",
+        "floyd_midtones_bayer_shadows",
+        "atkinson_highlights_stucki_shadows",
+        "two_pass_bayer_then_floyd",
+        "two_pass_threshold_then_jarvis",
+        "two_pass_soft_edges_atkinson",
+    ]
+
     base_candidates: list[Candidate] = []
     for threshold in thresholds:
         for algorithm in algorithms:
@@ -1459,45 +1789,7 @@ def build_candidates(
     # Segunda capa: opciones más agresivas, útiles cuando la referencia parece tener textura tipo acrylic.
     aggressive_candidates: list[Candidate] = []
     for threshold in (quantile_threshold - 18, quantile_threshold - 9, quantile_threshold, quantile_threshold + 9, quantile_threshold + 18, otsu):
-        for algorithm in (
-            "floyd",
-            "floyd_serpentine",
-            "atkinson",
-            "atkinson_serpentine",
-            "jarvis",
-            "jarvis_serpentine",
-            "stucki",
-            "stucki_serpentine",
-            "burkes",
-            "burkes_serpentine",
-            "sierra3",
-            "sierra3_serpentine",
-            "sierra2",
-            "sierra2_serpentine",
-            "sierra_lite",
-            "sierra_lite_serpentine",
-            "blue_noise16",
-            "sierra3_blue_mix",
-            "burkes_blue_mix",
-            "burkes_blue_mix_narrow",
-            "burkes_blue_mix_wide",
-            "burkes_blue_mix_softblue",
-            "burkes_blue_mix_hardblue",
-            "burkes_blue_mix_tightmid",
-            "sierra3_midtones_blue_extremes",
-            "two_pass_blue_then_sierra3",
-            "bayer8",
-            "floyd_bayer8_mix",
-            "stucki_bayer8_mix",
-            "jarvis_bayer8_edge_mix",
-            "atkinson_bayer8_edge_mix",
-            "jarvis_midtones_threshold_extremes",
-            "floyd_midtones_bayer_shadows",
-            "atkinson_highlights_stucki_shadows",
-            "two_pass_bayer_then_floyd",
-            "two_pass_threshold_then_jarvis",
-            "two_pass_soft_edges_atkinson",
-        ):
+        for algorithm in aggressive_algorithms:
             for invert in (True, False):
                 for contrast in (0.85, 1.15, 1.45):
                     for brightness in (-18.0, 0.0, 18.0):
@@ -1519,44 +1811,6 @@ def build_candidates(
 
     # Tercera capa: búsqueda local alrededor de los rangos que suelen parecerse al target ImagR/Acrylic.
     focused_candidates: list[Candidate] = []
-    focused_algorithms = (
-        "floyd",
-        "floyd_serpentine",
-        "stucki",
-        "stucki_serpentine",
-        "jarvis",
-        "jarvis_serpentine",
-        "atkinson",
-        "atkinson_serpentine",
-        "burkes",
-        "burkes_serpentine",
-        "sierra3",
-        "sierra3_serpentine",
-        "sierra2",
-        "sierra2_serpentine",
-        "sierra_lite",
-        "sierra_lite_serpentine",
-        "blue_noise16",
-        "sierra3_blue_mix",
-        "burkes_blue_mix",
-        "burkes_blue_mix_narrow",
-        "burkes_blue_mix_wide",
-        "burkes_blue_mix_softblue",
-        "burkes_blue_mix_hardblue",
-        "burkes_blue_mix_tightmid",
-        "sierra3_midtones_blue_extremes",
-        "two_pass_blue_then_sierra3",
-        "floyd_bayer8_mix",
-        "stucki_bayer8_mix",
-        "jarvis_bayer8_edge_mix",
-        "atkinson_bayer8_edge_mix",
-        "jarvis_midtones_threshold_extremes",
-        "floyd_midtones_bayer_shadows",
-        "atkinson_highlights_stucki_shadows",
-        "two_pass_bayer_then_floyd",
-        "two_pass_threshold_then_jarvis",
-        "two_pass_soft_edges_atkinson",
-    )
     for threshold in range(max(1, quantile_threshold - 30), min(255, quantile_threshold + 31), 5):
         for contrast in (0.55, 0.62, 0.68, 0.75, 0.82, 0.9):
             for brightness in (10.0, 16.0, 20.0, 24.0, 30.0):
@@ -1577,7 +1831,16 @@ def build_candidates(
 
     # Capa densa: factor extra para deduplicación al mezclar buckets; nunca supera MAX_CANDIDATES_PER_RUN.
     dense_cap = min(MAX_CANDIDATES_PER_RUN, max(1, max(limit, int(limit * 1.35))))
-    dense_candidates = dense_blue_family_candidates(quantile_threshold, otsu, dense_cap, sampling, sobol_seed)
+    dense_candidates = dense_blue_family_candidates(
+        quantile_threshold,
+        otsu,
+        dense_cap,
+        sampling,
+        sobol_seed,
+        dense_threshold_min,
+        dense_threshold_max,
+        search_preset,
+    )
 
     buckets = [dense_candidates, focused_candidates, aggressive_candidates, base_candidates]
     candidates: list[Candidate] = []
@@ -1619,6 +1882,7 @@ def focused_candidates(center_threshold: int, limit: int) -> list[Candidate]:
         "sierra_lite",
         "sierra_lite_serpentine",
         "blue_noise16",
+        "blue_noise_vac32",
         "sierra3_blue_mix",
         "burkes_blue_mix",
         "burkes_blue_mix_narrow",
@@ -1741,7 +2005,20 @@ def read_top_candidates(db_path: Path, top_k: int, best_per_algorithm: bool = Fa
     return [candidate_from_row(row) for row in rows]
 
 
-def neighbor_algorithms(algorithm: str) -> tuple[str, ...]:
+def neighbor_algorithms(algorithm: str, breadth: str = "normal") -> tuple[str, ...]:
+    """Vecinos de algoritmo para expandir refine-db; breadth deep/max incluye mezclas halftone."""
+    deep = breadth in ("deep", "max")
+    mx = breadth == "max"
+
+    halftone_mix = (
+        "jarvis_bayer8_edge_mix",
+        "stucki_bayer8_mix",
+        "floyd_bayer8_mix",
+        "atkinson_bayer8_edge_mix",
+        "two_pass_threshold_then_jarvis",
+        "two_pass_bayer_then_floyd",
+    )
+
     sierra_family = (
         "sierra3_serpentine",
         "two_pass_blue_then_sierra3",
@@ -1760,10 +2037,45 @@ def neighbor_algorithms(algorithm: str) -> tuple[str, ...]:
         "burkes_blue_mix_hardblue",
         "burkes_blue_mix_tightmid",
     )
+
+    if algorithm == "threshold" and deep:
+        core = (
+            "threshold",
+            "bayer8",
+            "blue_noise16",
+            "blue_noise_vac32",
+            "floyd_bayer8_mix",
+            "stucki_bayer8_mix",
+            "jarvis_bayer8_edge_mix",
+            "jarvis",
+            "jarvis_serpentine",
+            "stucki",
+            "stucki_serpentine",
+            "sierra3_blue_mix",
+            "two_pass_threshold_then_jarvis",
+            "burkes_blue_mix",
+            "floyd",
+            "floyd_serpentine",
+            "sierra3_serpentine",
+        )
+        return core + (("floyd_midtones_bayer_shadows", "two_pass_soft_edges_atkinson") if mx else ())
+
     if "sierra" in algorithm or "burkes" in algorithm or "blue" in algorithm:
-        return sierra_family
+        return sierra_family + halftone_mix if deep else sierra_family
+
+    if "stucki" in algorithm:
+        base = (
+            "stucki",
+            "stucki_serpentine",
+            "stucki_bayer8_mix",
+            "jarvis_bayer8_edge_mix",
+            "jarvis_serpentine",
+            "sierra3_blue_mix",
+        )
+        return base + halftone_mix if deep else base
+
     if "floyd" in algorithm:
-        return (
+        base = (
             "floyd",
             "floyd_serpentine",
             "floyd_midtones_bayer_shadows",
@@ -1771,15 +2083,23 @@ def neighbor_algorithms(algorithm: str) -> tuple[str, ...]:
             "sierra3_serpentine",
             "sierra3_blue_mix",
         )
+        return base + halftone_mix if deep else base
+
     if "jarvis" in algorithm:
-        return (
+        base = (
             "jarvis",
             "jarvis_serpentine",
             "jarvis_midtones_threshold_extremes",
             "two_pass_threshold_then_jarvis",
+            "jarvis_bayer8_edge_mix",
             "sierra3_serpentine",
         )
-    return (algorithm, "sierra3_serpentine", "burkes_serpentine", "two_pass_blue_then_sierra3")
+        return base + halftone_mix if deep else base
+
+    tail = ("sierra3_serpentine", "burkes_serpentine", "two_pass_blue_then_sierra3")
+    if deep:
+        return (algorithm,) + tail + halftone_mix
+    return (algorithm,) + tail
 
 
 def ordered_unique(values: list[float] | list[int]) -> list:
@@ -1793,28 +2113,56 @@ def ordered_unique(values: list[float] | list[int]) -> list:
     return unique
 
 
-def local_refine_candidates(db_path: Path, top_k: int, limit: int, best_per_algorithm: bool = False) -> list[Candidate]:
+def local_refine_candidates(
+    db_path: Path,
+    top_k: int,
+    limit: int,
+    best_per_algorithm: bool = False,
+    breadth: str = "normal",
+) -> list[Candidate]:
+    """
+    Expande vecindarios alrededor de los mejores en SQLite.
+
+    breadth:
+      normal — tamano historico (mesetas locales pequenas).
+      deep   — mas umbrales, tonos y halftone-mix vecinos.
+      max    — deep + rango de umbral aun mayor (consume --n mas rapido).
+    """
+    if breadth not in ("normal", "deep", "max"):
+        breadth = "normal"
     anchors = read_top_candidates(db_path, top_k, best_per_algorithm)
-    candidates: list[Candidate] = []
+    unique: list[Candidate] = []
+    seen: set[Candidate] = set()
     for anchor in anchors:
-        thresholds = ordered_unique(
-            [
-                int(np.clip(anchor.threshold + delta, 1, 254))
-                for delta in (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -8, 8)
-            ]
-        )
-        contrasts = ordered_unique(
-            [round(max(0.35, anchor.contrast + delta), 3) for delta in (0.0, -0.02, 0.02, -0.04, 0.04, -0.08, 0.08)]
-        )
-        brightnesses = ordered_unique(
-            [round(anchor.brightness + delta, 3) for delta in (0.0, -2.0, 2.0, -4.0, 4.0, -6.0, 6.0, -3.0, 3.0)]
-        )
-        gammas = ordered_unique(
-            [round(max(0.45, anchor.gamma + delta), 3) for delta in (0.0, -0.04, 0.04, -0.06, 0.06, -0.12, 0.12)]
-        )
-        autocontrasts = ordered_unique([round(max(0.0, anchor.autocontrast + delta), 3) for delta in (0.0, -1.0, 1.0, 2.0)])
-        sharpens = ordered_unique([anchor.sharpen, 0.0, 60.0, 100.0])
-        algorithms = neighbor_algorithms(anchor.algorithm)
+        if breadth == "normal":
+            thr_deltas = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -8, 8]
+            c_deltas = [0.0, -0.02, 0.02, -0.04, 0.04, -0.08, 0.08]
+            b_deltas = [0.0, -2.0, 2.0, -4.0, 4.0, -6.0, 6.0, -3.0, 3.0]
+            g_deltas = [0.0, -0.04, 0.04, -0.06, 0.06, -0.12, 0.12]
+            ac_deltas = [0.0, -1.0, 1.0, 2.0]
+            sharp_opts = [anchor.sharpen, 0.0, 60.0, 100.0]
+        elif breadth == "deep":
+            thr_deltas = list(range(-14, 15)) + [-18, 18, -22, 22]
+            c_deltas = [0.0, -0.02, 0.02, -0.04, 0.04, -0.06, 0.06, -0.08, 0.08, -0.1, 0.1, -0.12, 0.12]
+            b_deltas = [0.0, -2.0, 2.0, -4.0, 4.0, -6.0, 6.0, -8.0, 8.0, -10.0, 10.0, -12.0, 12.0]
+            g_deltas = [0.0, -0.04, 0.04, -0.06, 0.06, -0.08, 0.08, -0.1, 0.1, -0.14, 0.14, -0.18, 0.18]
+            ac_deltas = [0.0, -1.0, 1.0, 2.0, -2.0, 3.0]
+            sharp_opts = [anchor.sharpen, 0.0, 40.0, 80.0, 120.0, 160.0]
+        else:
+            thr_deltas = list(range(-14, 15)) + [-18, 18, -22, 22] + list(range(-24, 25, 2))
+            c_deltas = [0.0, -0.02, 0.02, -0.04, 0.04, -0.06, 0.06, -0.08, 0.08, -0.1, 0.1, -0.14, 0.14]
+            b_deltas = [0.0, -2.0, 2.0, -4.0, 4.0, -6.0, 6.0, -8.0, 8.0, -10.0, 10.0, -14.0, 14.0]
+            g_deltas = [0.0, -0.04, 0.04, -0.06, 0.06, -0.08, 0.08, -0.12, 0.12, -0.16, 0.16, -0.2, 0.2]
+            ac_deltas = [0.0, -1.0, 1.0, 2.0, -2.0, 3.0, 4.0]
+            sharp_opts = [anchor.sharpen, 0.0, 40.0, 80.0, 120.0, 160.0, 200.0]
+
+        thresholds = ordered_unique([int(np.clip(anchor.threshold + int(d), 1, 254)) for d in thr_deltas])
+        contrasts = ordered_unique([round(max(0.35, anchor.contrast + delta), 3) for delta in c_deltas])
+        brightnesses = ordered_unique([round(anchor.brightness + delta, 3) for delta in b_deltas])
+        gammas = ordered_unique([round(max(0.45, anchor.gamma + delta), 3) for delta in g_deltas])
+        autocontrasts = ordered_unique([round(max(0.0, anchor.autocontrast + delta), 3) for delta in ac_deltas])
+        sharpens = ordered_unique([float(s) for s in sharp_opts])
+        algorithms = neighbor_algorithms(anchor.algorithm, breadth)
         for contrast in contrasts:
             for brightness in brightnesses:
                 for gamma in gammas:
@@ -1822,27 +2170,22 @@ def local_refine_candidates(db_path: Path, top_k: int, limit: int, best_per_algo
                         for sharpen in sharpens:
                             for algorithm in algorithms:
                                 for threshold in thresholds:
-                                    candidates.append(
-                                        Candidate(
-                                            algorithm,
-                                            anchor.invert,
-                                            threshold,
-                                            contrast,
-                                            brightness,
-                                            gamma,
-                                            autocontrast,
-                                            sharpen,
-                                        )
+                                    candidate = Candidate(
+                                        algorithm,
+                                        anchor.invert,
+                                        threshold,
+                                        contrast,
+                                        brightness,
+                                        gamma,
+                                        autocontrast,
+                                        sharpen,
                                     )
-    unique: list[Candidate] = []
-    seen: set[Candidate] = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        unique.append(candidate)
-        if len(unique) >= limit:
-            break
+                                    if candidate in seen:
+                                        continue
+                                    seen.add(candidate)
+                                    unique.append(candidate)
+                                    if len(unique) >= limit:
+                                        return unique
     return unique
 
 
@@ -2068,15 +2411,21 @@ def guided_run_evaluation(
     max_evals = args.n
     best_global = float("inf")
     best_anchor: Candidate | None = None
+    eval_at_last_best = 0
+    last_stagnation_inject_eval = 0
+    refine_stagnation_every = max(0, int(args.refine_stagnation_inject_every))
     rng = np.random.default_rng(args.explore_seed)
 
     plateau_on = args.plateau_detect
+    plateau_window_req = int(args.plateau_window)
+    plateau_window_eff = min(plateau_window_req, max(24, int(args.n) // 2))
+    cap_note = f" (cap n/2 vs solicitado {plateau_window_req})" if plateau_on and plateau_window_eff < plateau_window_req else ""
     print(
-        f"[CONFIG] plateau_detect={plateau_on} window={args.plateau_window} std_max={args.plateau_std_max}",
+        f"[CONFIG] plateau_detect={plateau_on} window={plateau_window_eff}{cap_note} std_max={args.plateau_std_max}",
         flush=True,
     )
     plateau_detector: laser_plateau.PlateauDetector | None = (
-        laser_plateau.PlateauDetector(args.plateau_window, args.plateau_std_max) if plateau_on else None
+        laser_plateau.PlateauDetector(plateau_window_eff, args.plateau_std_max) if plateau_on else None
     )
     batch_on = args.batch_early_stop
     batch_size = args.guided_batch_size
@@ -2091,14 +2440,20 @@ def guided_run_evaluation(
     last_completed_batch_best: float | None = None
 
     sv = str(getattr(args, "score_version", "v1"))
-    init_worker(base_gray, target_gray, target_binary, target_density, target_edges, sv)
+    recycle = max(0, int(getattr(args, "worker_recycle_tasks", 48)))
+    ppd = float(getattr(args, "ppd", 64.0))
+    sharpen_radius = float(getattr(args, "_resolved_sharpen_radius", 1.2))
+
     executor: ProcessPoolExecutor | None = None
     if worker_count > 1:
-        executor = ProcessPoolExecutor(
-            max_workers=worker_count,
+        executor = create_match_executor(
+            worker_count,
+            recycle_every=recycle,
             initializer=init_worker,
-            initargs=(base_gray, target_gray, target_binary, target_density, target_edges, sv),
+            initargs=(base_gray, target_gray, target_binary, target_density, target_edges, sv, ppd, sharpen_radius),
         )
+    else:
+        init_worker(base_gray, target_gray, target_binary, target_density, target_edges, sv, ppd, sharpen_radius)
 
     def drain_chunk(task_pairs: list[tuple[int, Candidate]]) -> list[tuple[int, Candidate, np.ndarray, float, float, float, float, float]]:
         if not task_pairs:
@@ -2130,7 +2485,14 @@ def guided_run_evaluation(
 
             batch_aborted = False
             while active_batch and eval_count < max_evals:
-                take = min(chunk_tasks_max, len(active_batch) if batch_on else len(work))
+                remaining = max_evals - eval_count
+                if remaining <= 0:
+                    break
+                take = min(
+                    chunk_tasks_max,
+                    len(active_batch) if batch_on else len(work),
+                    remaining,
+                )
                 if take <= 0:
                     break
                 chunk_pairs: list[tuple[int, Candidate]] = []
@@ -2145,6 +2507,7 @@ def guided_run_evaluation(
                     if score < best_global:
                         best_global = score
                         best_anchor = candidate
+                        eval_at_last_best = eval_count
                     batch_this_best = min(batch_this_best, score)
                     eval_count += 1
                     evals_in_current_batch += 1
@@ -2192,7 +2555,15 @@ def guided_run_evaluation(
                     )
                     if eval_count % 50 == 0:
                         db.commit()
-                        print(f"  {eval_count}/{max_evals} best={best_global:.4f}", flush=True)
+                        prog_tail = ""
+                        if best_anchor is not None and math.isfinite(best_global):
+                            stall = eval_count - eval_at_last_best
+                            prog_tail = (
+                                f" (sin_mejora_{stall}eval)"
+                                if stall > 0
+                                else " (mejor_actualizado)"
+                            )
+                        print(f"  {eval_count}/{max_evals} best={best_global:.4f}{prog_tail}", flush=True)
 
                     if plateau_detector is not None:
                         act = plateau_detector.observe(score)
@@ -2208,6 +2579,7 @@ def guided_run_evaluation(
                                 restart_n,
                                 rng,
                                 best_anchor,
+                                brutal=bool(getattr(args, "explore_brutal", False)),
                             )
                             added = 0
                             for c in inject:
@@ -2220,6 +2592,42 @@ def guided_run_evaluation(
                                     work.appendleft(c)
                                 added += 1
                             print(f"  [PLATEAU] candidatos perturbados encolados: {added}", flush=True)
+
+                    # Refinamiento local: sin plateau (o con plateau raro) igual puede estancarse el mejor global.
+                    if (
+                        refine_stagnation_every > 0
+                        and getattr(args, "refine_db", None) is not None
+                        and best_anchor is not None
+                    ):
+                        stall = eval_count - eval_at_last_best
+                        if stall >= refine_stagnation_every and (
+                            eval_count - last_stagnation_inject_eval
+                        ) >= refine_stagnation_every:
+                            n_inj = max(400, restart_n // 3)
+                            inject_stag = perturb_candidates_restart(
+                                base_gray,
+                                target_white_ratio,
+                                n_inj,
+                                rng,
+                                best_anchor,
+                                brutal=True,
+                            )
+                            added_s = 0
+                            for c in inject_stag:
+                                ch = candidate_param_hash(c)
+                                if ch in seen_eval_hashes:
+                                    continue
+                                if batch_on:
+                                    active_batch.appendleft(c)
+                                else:
+                                    work.appendleft(c)
+                                added_s += 1
+                            print(
+                                f"  [REFINE-STAGNATION] +{added_s} perturb brutales "
+                                f"(mejor sin mejorar {stall} evals)",
+                                flush=True,
+                            )
+                            last_stagnation_inject_eval = eval_count
 
                     if batch_on and checkpoint_every > 0 and evals_in_current_batch > 0 and evals_in_current_batch % checkpoint_every == 0:
                         if math.isfinite(snapshot_at_batch_start):
@@ -2282,7 +2690,8 @@ def guided_run_evaluation(
 
     finally:
         if executor is not None:
-            executor.shutdown()
+            executor.shutdown(wait=True)
+        clear_main_worker_arrays()
 
     db.commit()
     return results
@@ -2292,6 +2701,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Ajuste por búsqueda contra imagen target")
     parser.add_argument("--input", required=True, type=Path, help="Foto original")
     parser.add_argument("--target", required=True, type=Path, help="Imagen objetivo/reference")
+    parser.add_argument(
+        "--luma",
+        choices=("bt601", "bt709"),
+        default="bt601",
+        help="Pesos R'G'B'->gris: bt601 (default, historico) o bt709 (HD / fotografia web).",
+    )
+    parser.add_argument(
+        "--search-preset",
+        choices=("default", "acrylic"),
+        default="default",
+        help="acrylic: solo la capa densa blue-family reparte mas Jarvis/Stucki/Sierra/Burkes (round-robin); capas base/focused sin cambio.",
+    )
     parser.add_argument("--out", required=True, type=Path, help="Carpeta de salida")
     parser.add_argument(
         "--n",
@@ -2310,10 +2731,35 @@ def main() -> int:
     parser.add_argument("--refine-top", type=int, default=3, help="Cantidad de anclas a expandir desde --refine-db")
     parser.add_argument("--refine-best-per-algorithm", action="store_true", help="Usa top N por algoritmo como anclas de --refine-db")
     parser.add_argument(
+        "--refine-breadth",
+        choices=("normal", "deep", "max"),
+        default="normal",
+        help="Solo con --refine-db: tamano del vecindario (threshold/contrast/gamma/sharpen y vecinos de algoritmo).",
+    )
+    parser.add_argument(
+        "--refine-stagnation-inject-every",
+        type=int,
+        default=-1,
+        metavar="N",
+        help="Con --refine-db + guiado: tras N evals sin mejorar el mejor, inyecta perturb brutales (-1=2200, 0=off).",
+    )
+    parser.add_argument(
+        "--explore-brutal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Tras plateau en modo guiado: perturbaciones mas amplias y pool de algoritmos mixtos extra.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=0,
-        help="Procesos paralelos por imagen. 0 = todos los núcleos lógicos (os.cpu_count); 1 = secuencial/debug",
+        help="Procesos paralelos por imagen. 0 = todos los núcleos (cap opcional: env LASER_MATCH_MAX_WORKERS); 1 = secuencial",
+    )
+    parser.add_argument(
+        "--worker-recycle-tasks",
+        type=int,
+        default=48,
+        help="Con multiproceso (Py>=3.11): reinicia cada worker tras N evaluaciones para limitar RAM en Windows. 0=desactivar.",
     )
     parser.add_argument("--resume", action="store_true", help="No limpiar salida previa")
     parser.add_argument(
@@ -2336,6 +2782,12 @@ def main() -> int:
     )
     parser.add_argument("--plateau-window", type=int, default=DEFAULT_PLATEAU_WINDOW, help="Ventana movil de scores para plateau")
     parser.add_argument("--plateau-std-max", type=float, default=DEFAULT_PLATEAU_STD_MAX, help="Umbral std (plateau si std < este valor)")
+    parser.add_argument(
+        "--sort-candidates",
+        choices=("none", "threshold-proximity"),
+        default="none",
+        help="Modo guiado: orden de la cola; threshold-proximity evalua antes umbrales cerca Otsu/cuantil del input.",
+    )
     parser.add_argument(
         "--batch-early-stop",
         action=argparse.BooleanOptionalAction,
@@ -2435,7 +2887,55 @@ def main() -> int:
         help="multimask_output del modelo (varias hipótesis por prompt).",
     )
     parser.add_argument("--sam2-mask-index", type=int, default=0, help="Índice máscara si multimask (ciclo según canales).")
-    parser.add_argument("--score-version", choices=("v1", "v2"), default="v1", help="Version de metrica de score (v2: SSIM+reg)")
+    parser.add_argument(
+        "--score-version",
+        choices=("v1", "v2", "v3", "v4", "v5"),
+        default="v1",
+        help="Metrica: v1 legacy; v2 SSIM continuo + reg; v3 v2 + SSIM blur vs binario; "
+        "v4 blur simetrico + LPIPS(Alex) sobre campos suavizados + legacy parcial "
+        "(requiere pip install -e \".[perceptual]\"); "
+        "v5 SIN REFERENCIA: HVS-MSE (CSF) + spectral radial penalty + tone match post-LUT, "
+        "para calidad fisica del halftone (target_gray se reemplaza por input gray).",
+    )
+    parser.add_argument(
+        "--material",
+        type=str,
+        default="",
+        help="Nombre de MaterialProfile (ej. 'acrylic_back_engrave', 'wood_generic'). "
+        "Aplica LUT al gris (compensa dot-gain) y valida DPI contra spot del material.",
+    )
+    parser.add_argument(
+        "--material-presets-dir",
+        type=Path,
+        default=None,
+        help="Directorio con JSONs de materiales custom (default: solo builtins programaticos).",
+    )
+    parser.add_argument(
+        "--ppd",
+        type=float,
+        default=64.0,
+        help="Pixels per degree para filtro CSF Mannos-Sakrison del score v5 (default 64; "
+        "razonable para ~300 DPI a 50 cm).",
+    )
+    parser.add_argument(
+        "--output-mm-short",
+        type=float,
+        default=0.0,
+        help="Lado corto fisico del grabado en mm. Combinado con --output-dpi escala USM al output (R3).",
+    )
+    parser.add_argument(
+        "--output-dpi",
+        type=int,
+        default=0,
+        help="DPI del grabado final. Con --material valida contra spot; con --output-mm-short escala USM.",
+    )
+    parser.add_argument(
+        "--sharpen-radius-mm",
+        type=float,
+        default=0.10,
+        help="Radius USM en mm fisicos del output (regla 3). Default 0.10 mm (~mitad spot tipico). "
+        "Se ignora si --output-mm-short o --output-dpi == 0 (queda radius=1.2 px legacy).",
+    )
     parser.add_argument(
         "--sampling",
         choices=("grid", "sobol"),
@@ -2443,6 +2943,18 @@ def main() -> int:
         help="Muestreo de la capa densa blue-family (Sobol por defecto).",
     )
     parser.add_argument("--sobol-seed", type=int, default=42, help="Semilla Sobol (capa densa)")
+    parser.add_argument(
+        "--dense-threshold-min",
+        type=int,
+        default=0,
+        help="Si >0, limita umbrales inferiores de la capa densa blue-family (afinar busqueda).",
+    )
+    parser.add_argument(
+        "--dense-threshold-max",
+        type=int,
+        default=0,
+        help="Si >0, limita umbrales superiores de la capa densa (usar con --dense-threshold-min).",
+    )
     parser.add_argument(
         "--epsilon-mode",
         choices=("fixed", "adaptive"),
@@ -2456,10 +2968,36 @@ def main() -> int:
         help="Alineacion ECC del input al target antes del preprocess.",
     )
     args = parser.parse_args()
+    plateau_explicit = any(x in sys.argv for x in ("--plateau-detect", "--no-plateau-detect"))
+    if args.refine_db is not None and not plateau_explicit:
+        args.plateau_detect = False
+        print(
+            "[INFO] refine-db: plateau-detect=OFF por defecto "
+            "(evita reinicios en bucle cuando el mejor ya converge); "
+            "--plateau-detect para volver al comportamiento anterior.",
+            flush=True,
+        )
+    if args.refine_db is None:
+        args.refine_stagnation_inject_every = 0
+    elif args.refine_stagnation_inject_every < 0:
+        args.refine_stagnation_inject_every = 2200
+        print(
+            f"[INFO] refine-db: anti-estancamiento cada {args.refine_stagnation_inject_every} evals sin mejora "
+            "(--refine-stagnation-inject-every 0 para desactivar)",
+            flush=True,
+        )
+    set_gray_luma_standard(args.luma)
+    if args.search_preset == "acrylic":
+        print("[CONFIG] search-preset=acrylic (solo capa densa: mas Jarvis/Stucki/Sierra/Burkes en round-robin)", flush=True)
     guided_flags = ("--guided-explore", "--no-guided-explore")
     if not any(x in sys.argv for x in guided_flags) and args.n > 2000:
         args.guided_explore = True
         print(f"[INFO] guided-explore activado automaticamente (n={args.n} > 2000)", flush=True)
+    if args.explore_brutal:
+        print("[CONFIG] explore-brutal: perturbaciones tras plateau mas amplias", flush=True)
+        if args.restart_candidates == DEFAULT_RESTART_CANDIDATES:
+            args.restart_candidates = 2800
+            print("[CONFIG] restart-candidates sube a 2800 (default); usa --restart-candidates para fijar otro valor.", flush=True)
     if args.n > MAX_CANDIDATES_PER_RUN:
         print(
             f"Aviso: --n={args.n} supera el máximo por corrida ({MAX_CANDIDATES_PER_RUN:,}); "
@@ -2473,6 +3011,8 @@ def main() -> int:
             "usa --max-side > 0 para explorar antes en baja resolución.",
             flush=True,
         )
+
+    _configure_score_v4_cuda_efficiency(args)
 
     try:
         input_image = load_rgb(args.input)
@@ -2607,22 +3147,111 @@ def main() -> int:
     target_edges = edge_map(target_gray)
     target_white_ratio = float(np.mean(target_binary == 255))
 
+    # --- R1b + R2 + R3 + R4 wiring -------------------------------------------------
+    # Material LUT: aplicar al gris de entrada (compensa dot-gain) y validar DPI por spot.
+    material_lut_applied = False
+    if str(getattr(args, "material", "")):
+        if laser_physics is None:
+            print("[MATERIAL] laser_physics no disponible; ignorando --material", flush=True)
+        else:
+            try:
+                profile = laser_physics.load_material_profile(
+                    args.material, presets_dir=args.material_presets_dir
+                )
+                print(
+                    f"[MATERIAL] {profile.name} spot={profile.spot_mm:.3f}mm "
+                    f"default_dpi={profile.default_dpi} tone={profile.tone_response} "
+                    f"power_pct={profile.power_pct_range}",
+                    flush=True,
+                )
+                if args.output_dpi > 0:
+                    warn = profile.validate_dpi(args.output_dpi, emit_warning=False)
+                    if warn:
+                        print(f"[MATERIAL] WARN: {warn}", flush=True)
+                # Aplicar LUT al base_gray (dither corre sobre gris LUT'd)
+                base_gray = profile.lut()(base_gray.astype(np.uint8)).astype(np.float64)
+                material_lut_applied = True
+                print(
+                    f"[MATERIAL] LUT aplicada a base_gray; pipeline compensa dot-gain del material.",
+                    flush=True,
+                )
+            except (KeyError, ValueError, FileNotFoundError) as exc:
+                print(f"[MATERIAL] ERROR cargando perfil '{args.material}': {exc}", file=sys.stderr)
+                return 2
+
+    # Score v5: target_gray pasa a ser el input gray (no-reference mode).
+    # target_binary/density/edges no se usan en v5 (la dispatch los ignora).
+    if str(args.score_version) == "v5":
+        print(
+            "[V5] no-reference mode: target_gray <- base_gray (input post-LUT). "
+            f"ppd={args.ppd:.1f}.",
+            flush=True,
+        )
+        target_gray = base_gray.copy()
+        target_binary = np.where(target_gray > 127, 255, 0).astype(np.uint8)
+        target_density = density_map(target_gray)
+        target_edges = edge_map(target_gray)
+        target_white_ratio = float(np.mean(target_binary == 255))
+
+    # Sharpen radius escalado al output fisico (cierra regla 3 de RULES).
+    resolved_radius = 1.2  # legacy default
+    if args.output_mm_short > 0 and args.output_dpi > 0 and laser_physics is not None:
+        ranking_short = int(min(base_gray.shape))
+        resolved_radius = laser_physics.scaled_unsharp_radius(
+            ranking_pixels_short_side=ranking_short,
+            output_mm_short_side=float(args.output_mm_short),
+            output_dpi=int(args.output_dpi),
+            radius_mm=float(args.sharpen_radius_mm),
+        )
+        print(
+            f"[SHARPEN] radius escalado al output: ranking={ranking_short}px "
+            f"output={args.output_mm_short:.1f}mm@{args.output_dpi}DPI radius_mm={args.sharpen_radius_mm} "
+            f"-> radius_ranking={resolved_radius:.3f}px (vs legacy 1.2)",
+            flush=True,
+        )
+    args._resolved_sharpen_radius = resolved_radius  # consumido por init_worker
+    # --- fin R1b/R2/R3/R4 ---------------------------------------------------------
+
     if args.refine_db is not None:
-        candidates = local_refine_candidates(args.refine_db, args.refine_top, args.n, args.refine_best_per_algorithm)
+        print(f"[CONFIG] refine-db breadth={args.refine_breadth}", flush=True)
+        candidates = local_refine_candidates(
+            args.refine_db,
+            args.refine_top,
+            args.n,
+            args.refine_best_per_algorithm,
+            breadth=args.refine_breadth,
+        )
     elif args.from_db is not None:
         candidates = read_top_candidates(args.from_db, args.from_db_top, args.from_db_best_per_algorithm)
     elif args.focus_threshold > 0:
         candidates = focused_candidates(args.focus_threshold, args.n)
     else:
+        dt_min = int(args.dense_threshold_min) if args.dense_threshold_min > 0 else None
+        dt_max = int(args.dense_threshold_max) if args.dense_threshold_max > 0 else None
+        if dt_min is not None and dt_max is not None and dt_min > dt_max:
+            dt_min, dt_max = dt_max, dt_min
+        if dt_min is not None or dt_max is not None:
+            print(
+                f"[CONFIG] dense_threshold_clip min={dt_min} max={dt_max}",
+                flush=True,
+            )
         candidates = build_candidates(
             base_gray,
             target_white_ratio,
             args.n,
             sampling=args.sampling,
             sobol_seed=args.sobol_seed,
+            dense_threshold_min=dt_min,
+            dense_threshold_max=dt_max,
+            search_preset=str(args.search_preset),
         )
     if len(candidates) >= 250_000:
         print(f"Candidatos únicos a evaluar: {len(candidates)} (mezcla densa + otras capas)", flush=True)
+
+    if args.guided_explore and args.sort_candidates == "threshold-proximity":
+        candidates = sort_candidates_threshold_proximity(candidates, base_gray, target_white_ratio)
+        print("[CONFIG] sort-candidates=threshold-proximity (cola reordenada)", flush=True)
+
     db = ensure_db(args.out / "match.sqlite")
     manifest_path = args.out / "match_manifest.jsonl"
     results: list[MatchResult] = []
@@ -2670,15 +3299,23 @@ def main() -> int:
                 flush=True,
             )
 
-        init_worker(base_gray, target_gray, target_binary, target_density, target_edges, str(args.score_version))
+        recycle = max(0, int(getattr(args, "worker_recycle_tasks", 48)))
+        executor_pg: ProcessPoolExecutor | None = None
 
         with manifest_path.open("w", encoding="utf-8") as manifest:
             tasks = list(enumerate(candidates, start=1))
+            ppd_arg = float(getattr(args, "ppd", 64.0))
+            sharpen_radius_arg = float(getattr(args, "_resolved_sharpen_radius", 1.2))
             if worker_count == 1:
+                init_worker(
+                    base_gray, target_gray, target_binary, target_density, target_edges,
+                    str(args.score_version), ppd_arg, sharpen_radius_arg,
+                )
                 evaluated = map(evaluate_candidate_task, tasks)
             else:
-                executor = ProcessPoolExecutor(
-                    max_workers=worker_count,
+                executor_pg = create_match_executor(
+                    worker_count,
+                    recycle_every=recycle,
                     initializer=init_worker,
                     initargs=(
                         base_gray,
@@ -2687,9 +3324,11 @@ def main() -> int:
                         target_density,
                         target_edges,
                         str(args.score_version),
+                        ppd_arg,
+                        sharpen_radius_arg,
                     ),
                 )
-                evaluated = executor.map(evaluate_candidate_task, tasks, chunksize=chunk)
+                evaluated = executor_pg.map(evaluate_candidate_task, tasks, chunksize=chunk)
 
             for idx, candidate, output, score, pixel_error, edge_error, white_ratio, elapsed in evaluated:
                 filename = f"match_{idx:04d}.png"
@@ -2737,8 +3376,10 @@ def main() -> int:
                     db.commit()
                     print(f"  {idx}/{len(candidates)} best={min(r.score for r in results):.4f}", flush=True)
 
-            if worker_count != 1:
-                executor.shutdown()
+            if executor_pg is not None:
+                executor_pg.shutdown(wait=True)
+
+        clear_main_worker_arrays()
 
     db.commit()
     db.close()

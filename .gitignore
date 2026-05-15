@@ -1,26 +1,57 @@
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
 *.egg-info/
+.pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.egg-info/
-dist/
-build/
-.env
+
+# Virtual environments
 .venv/
+.venv312/
 venv/
+env/
 
-# Experiment outputs (large); keep references if tracked separately
-runs/*
+# Secrets / env
+.env
+.env.local
+*.local.json
+
+# Build outputs (NO commitear el build estático; se reconstruye)
+web/build/
+web/.svelte-kit/
+web/node_modules/
+
+# Runs (experimentos efímeros, pueden crecer mucho)
+runs/
 !runs/references/
-!runs/references/**
+!runs/references/.gitkeep
 
-# Meta DB may live under runs/_meta per project convention
-!runs/_meta/
-runs/_meta/*.sqlite
-runs/_meta/*.sqlite-journal
+# Reportes locales
+reports/
 
-# Copias locales en la raiz del repo (canonicas bajo runs/references/ si aplica)
-/foto objetivo sin procesar.jpeg
-/imagr_acrylic*.png
+# Modelos / caches pesados
+*.pth
+*.safetensors
+
+# Editor / OS / agentes
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+.claude/
+
+# Imágenes sueltas en raíz que el usuario dropea
+/imagr_acrylic_*.png
+/foto*.jpeg
+/foto*.jpg
+/WhatsApp*.jpeg
+/WhatsApp*.png
+
+# Mantener referencias canónicas explícitas
+!runs/references/input_*.jpeg
+!runs/references/input_*.jpg
+!runs/references/input_*.png
+!runs/references/target_*.png
+!runs/references/sam2_*.json

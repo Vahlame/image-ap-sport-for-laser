@@ -22,6 +22,8 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import laser_runtime_env
+
 
 @dataclass
 class BatchRow:
@@ -113,7 +115,7 @@ def run_single_batch_item(
         str(worker_flag),
     ]
     print(f"[{index}/{total}] {image_path} -> {run_dir} (workers/hijo={worker_flag})", flush=True)
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, env=laser_runtime_env.child_process_env())
     return index, best_row(run_dir)
 
 
@@ -260,6 +262,7 @@ def main() -> int:
         "Si >1 y workers=0, reparte núcleos entre hijos (cpus/jobs por imagen).",
     )
     args = parser.parse_args()
+    laser_runtime_env.apply_lpips_default_process_env()
 
     if not args.target.is_file():
         print(f"No existe target: {args.target}", file=sys.stderr)
