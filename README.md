@@ -5,12 +5,13 @@ Preparación de imágenes para grabado láser CO2. Convierte una foto a color en
 láser cableada (DPI cap por spot, LUT por material, sharpen escalado al output
 físico, simulación de grabado).
 
-![Status](https://img.shields.io/badge/status-v1.3.0-success)
-![Tests](https://img.shields.io/badge/tests-140%2B%2F140%2B-success)
+![Status](https://img.shields.io/badge/status-v2.0.0-success)
+![Tests](https://img.shields.io/badge/tests-182%2F182-success)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
-![Installer](https://img.shields.io/badge/installer-.exe%20available-success)
+![Installer](https://img.shields.io/badge/installer-.exe%20%2B%20zip-success)
 ![Mode](https://img.shields.io/badge/mode-Express-brightgreen)
+![Presets](https://img.shields.io/badge/presets-9-blueviolet)
 
 ---
 
@@ -31,20 +32,77 @@ físico, simulación de grabado).
 
 ### Opción 1 — Instalador `.exe` (recomendado, doble-clic)
 
-1. Descargar `ImageAPLaser_Setup_v1.2.0.exe` desde
+1. Descargar `ImageAPLaser_Setup_v2.0.0.exe` desde
    [GitHub Releases](https://github.com/Vahlame/image-ap-sport-for-laser/releases/latest).
-2. Doble-clic → asistente estándar Windows (idioma, licencia, carpeta destino).
-3. Al terminar, Setup ejecuta automáticamente la instalación de Python, Node, y
+2. **Si Windows SmartScreen bloquea con "Windows protegió su PC"**: ver sección
+   [⚠️ Windows SmartScreen](#-windows-smartscreen-warning) abajo.
+3. Doble-clic → asistente estándar Windows (idioma, licencia, carpeta destino).
+4. Al terminar, Setup ejecuta automáticamente la instalación de Python, Node, y
    dependencias (via `winget`). Tarda ~15–30 min la primera vez.
-4. Acceso directo "Image AP Laser" creado en el Escritorio → doble-clic para arrancar.
+5. Acceso directo "Image AP Laser" creado en el Escritorio → doble-clic para arrancar.
 
-### Opción 2 — Manual (developers / sin Internet en instalación)
+### Opción 2 — ZIP portable (sin warning de SmartScreen)
+
+Si querés evitar el warning de SmartScreen del `.exe`:
+
+1. Descargar `ImageAPLaser_Portable_v2.0.0.zip` desde
+   [GitHub Releases](https://github.com/Vahlame/image-ap-sport-for-laser/releases/latest).
+2. Click derecho → **Propiedades → Desbloquear** (Windows "marca" archivos bajados de Internet).
+3. Extraer el ZIP a `C:\ImageAPLaser` (o donde prefieras).
+4. Doble-clic en `Setup_LaserApp.bat` → mismo workflow que el .exe pero sin warning.
+5. Después, `Iniciar_Laser_App.bat` para usar la app.
+
+### Opción 3 — Git clone (developers)
 
 ```powershell
 git clone https://github.com/Vahlame/image-ap-sport-for-laser
 cd image-ap-sport-for-laser
 Setup_LaserApp.bat       # configura todo: winget → Python/Node → venv → deps → web build
 Iniciar_Laser_App.bat    # arranca uvicorn + abre el wizard en el navegador
+```
+
+---
+
+## ⚠️ Windows SmartScreen Warning
+
+Cuando descargues el `.exe` por primera vez, Windows va a mostrar:
+
+> "Windows protegió su PC"
+> "SmartScreen de Microsoft Defender evitó que se iniciara una aplicación desconocida"
+> "Editor: Editor desconocido"
+
+**Esto NO significa que el .exe sea malicioso** — es el comportamiento normal de Windows
+para cualquier ejecutable que no esté firmado con un certificado Authenticode de pago
+(Verisign, DigiCert, etc., ~$400-700 USD/año) y que no haya acumulado "reputación" con
+suficientes descargas (~10,000+). Pasa con Git, VLC, Blender, Audacity, etc. en sus
+primeras releases.
+
+### Cómo evitarlo
+
+**Opción A — Bypass del warning (rápido)**:
+1. En el diálogo "Windows protegió su PC", hacer clic en **"Más información"**
+   (link chico debajo del texto azul).
+2. Aparece el botón **"Ejecutar de todas formas"** → clic.
+3. El installer arranca normalmente.
+
+**Opción B — Usar el ZIP portable**:
+Descargar `ImageAPLaser_Portable_v2.0.0.zip` en vez del `.exe`. Los ZIP **no
+generan warning de SmartScreen**. Click derecho → Propiedades → Desbloquear, extraer
+y correr `Setup_LaserApp.bat` igual que el .exe.
+
+**Opción C — Para mantainers/contribuidores**: ver
+[`docs/CODE_SIGNING.md`](docs/CODE_SIGNING.md) sobre cómo aplicar a
+[SignPath.io](https://signpath.io/) (firma gratis para proyectos OSS confirmados
+como este) o comprar un certificado comercial.
+
+### Cómo verificar que el .exe es legítimo
+
+Si querés validar la integridad del descargado contra el oficial:
+
+```powershell
+# El SHA256 del v2.0.0 oficial está publicado en la Release de GitHub
+Get-FileHash -Algorithm SHA256 ImageAPLaser_Setup_v2.0.0.exe
+# Debería coincidir con: 803b7f5987359b2a89a67b19dce5be809eac42efa97dd9d0524d387c4f264505
 ```
 
 ### Manual (dos terminales)
