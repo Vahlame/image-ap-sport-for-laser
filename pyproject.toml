@@ -1,8 +1,10 @@
 [project]
 name = "image-ap-sport-for-laser"
-version = "2.2.0"
+version = "2.3.0"
 description = "Image-to-PNG laser preparation: Express mode + auto-presets + HQ refinement + LightBurn recommendations"
-license = { text = "GPL-3.0-or-later" }
+# v2.3: dual licensing — GPL-3.0-or-later (open-source) o Commercial License
+# (closed-source / SaaS / producto). Ver LICENSE-COMMERCIAL.md.
+license = { text = "GPL-3.0-or-later OR Commercial" }
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

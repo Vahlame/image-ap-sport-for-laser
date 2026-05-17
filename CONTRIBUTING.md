@@ -1,8 +1,47 @@
 # Contribuir a Image AP — Laser Image Prep
 
-Bienvenidos PRs. La licencia es **GPL-3.0-or-later**: podés modificarlo, distribuirlo,
-usarlo comercialmente, pero los trabajos derivados deben **permanecer abiertos bajo la
-misma licencia** y **preservar los créditos** de los autores originales.
+Bienvenidos PRs.
+
+## ⚖️ Licenciamiento del proyecto (importante — leé antes de contribuir)
+
+Este proyecto usa **dual licensing** (desde v2.3):
+
+1. **GPL-3.0-or-later** para uso open-source / personal / educativo (gratis,
+   copyleft estricto — ver [`LICENSE`](LICENSE)).
+2. **Licencia Comercial separada** (royalty/% acordado con el copyright holder)
+   para uso closed-source / SaaS / producto físico — ver
+   [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).
+
+## 📝 Contributor License Agreement (CLA) — implícito
+
+Al enviar un Pull Request a este repositorio, **vos confirmás que**:
+
+1. **Sos el autor de la contribución** (o tenés permiso explícito de quien la
+   escribió, y que esa persona también acepta estos términos).
+2. **Tu contribución se incorpora bajo dual licensing** del proyecto:
+   - Bajo GPL-3.0 para uso open-source (igual que el resto del repo).
+   - **Bajo la licencia comercial alternativa** que el copyright holder
+     (Vahlame) tiene derecho a otorgar a terceros bajo términos comerciales.
+3. **Vos retenés tu copyright sobre tu contribución**, pero le otorgás al
+   copyright holder del proyecto una **licencia perpetua, gratuita, irrevocable,
+   no-exclusiva y mundial** para usar tu contribución bajo cualquiera de los
+   esquemas de licencia del proyecto, incluyendo sub-licenciamiento comercial.
+4. **Tu contribución no infringe** copyright, patentes, secretos comerciales,
+   ni otros derechos de terceros.
+
+Si **NO aceptás** estos términos, **NO envíes PRs a este repositorio** — podés
+forkear y mantener tu fork público bajo GPL-3.0 sin contribuir upstream.
+
+> Este modelo es estándar en proyectos OSS comerciales (Qt, MongoDB, GitLab,
+> MySQL, Apache Software Foundation usan variantes de esto). El propósito es
+> permitir que el proyecto sostenga su modelo dual-license sin que cada
+> contribuyente tenga que firmar un CLA separado.
+
+Si tu contribución es **sustancial** (>200 líneas, refactor mayor, módulo nuevo),
+nos podés contactar para discutir reconocimiento adicional (mención en
+README/AUTHORS, o consideración de revenue-share en casos especiales).
+
+---
 
 ## En 30 segundos
 

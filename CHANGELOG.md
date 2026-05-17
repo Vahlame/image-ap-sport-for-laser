@@ -4,6 +4,72 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [2.3.0] — 2026-05-17
+
+### ⚖️ Cambio de modelo de licenciamiento — DUAL LICENSING
+
+A pedido del maintainer (Vahlame), el proyecto pasa de **GPL-3.0-or-later puro**
+a un modelo de **dual licensing** estándar en la industria (similar a MySQL,
+Qt, GitLab, MongoDB, Ghostscript):
+
+#### 🟢 Camino A — GPL-3.0-or-later (gratis, copyleft)
+
+Sin cambios para uso open-source / personal / educativo / hobbyista.
+
+**Permitido sin pagar nada**:
+- Uso personal en tu taller para grabar piezas para clientes
+- Forks open-source bajo GPL-3.0
+- Educación, investigación, ONGs
+- Cursos pagos que usen el software como herramienta (no se distribuye el software)
+
+#### 🔴 Camino B — Licencia Comercial (negociada, royalty/%)
+
+**REQUERIDO para**:
+- Distribuir el software comercialmente (closed-source, producto físico embebido,
+  SaaS que use el software internamente).
+- Trabajos derivados que se distribuyan bajo otra licencia que no sea GPL-3.0.
+- Integraciones en producto B2B comercial.
+
+**Términos típicos** (sujeto a negociación caso por caso):
+- 3–12% royalty sobre ventas/MRR según volumen.
+- USD 500–5,000/año fee fijo según tamaño de empresa.
+- Pago único USD 2,000–20,000 según uso esperado.
+
+Ver detalles completos y cómo contactar en
+[`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).
+
+#### Archivos nuevos / modificados
+
+- `LICENSE-COMMERCIAL.md` (NEW): términos de licencia comercial draft (4 opciones
+  de pricing, beneficios, FAQ, proceso de adquisición).
+- `LICENSE` (sin cambios): sigue siendo GPL-3.0 íntegro.
+- `README.md`: nueva sección "Licencia — Dual Licensing" con tabla de casos
+  de uso ("lo uso en mi taller" vs "tengo un SaaS" vs "vendo una máquina con
+  el software", etc.). Badge `GPL-3.0 || Commercial`.
+- `CONTRIBUTING.md`: Contributor License Agreement (CLA) implícito — al enviar
+  un PR, el contributor confirma que su contribución se incorpora bajo dual
+  licensing y le otorga al copyright holder licencia perpetua para
+  sub-licenciar comercialmente. Estándar en proyectos OSS comerciales.
+- `pyproject.toml`: `license = "GPL-3.0-or-later OR Commercial"`.
+
+#### Notas legales importantes
+
+- **Versiones YA distribuidas (v1.0 → v2.2) siguen siendo GPL-3.0 íntegramente.**
+  El cambio aplica para v2.3+ y para casos de uso futuros que requieran
+  exención del copyleft GPL.
+- **Algoritmos científicos NO se restringen**: Floyd-Steinberg 1976, Jarvis
+  1976, Stucki 1981, Atkinson 1986, etc. son dominio público — cualquiera
+  puede implementarlos desde los papers originales.
+- **Lo protegido por copyright**: la implementación específica en Python
+  (+ optimizaciones numba), el auto-detector con 5 reglas + presets curados,
+  el score v5 (HVS-MSE + spectral + edge preservation), el wizard SvelteKit,
+  el plain_region_simplification + auto-mirror, las integraciones LightBurn.
+
+#### Sin cambios en código / tests
+
+Esta release **NO modifica código funcional**, solo licenciamiento y docs.
+186 tests siguen verdes, build idéntico.
+
 ## [2.2.0] — 2026-05-16
 
 ### Cierre de auditoría — los bugs de severidad baja/media restantes

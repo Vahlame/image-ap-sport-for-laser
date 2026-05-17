@@ -5,13 +5,18 @@ Preparación de imágenes para grabado láser CO2. Convierte una foto a color en
 láser cableada (DPI cap por spot, LUT por material, sharpen escalado al output
 físico, simulación de grabado).
 
-![Status](https://img.shields.io/badge/status-v2.0.0-success)
-![Tests](https://img.shields.io/badge/tests-182%2F182-success)
+![Status](https://img.shields.io/badge/status-v2.3.0-success)
+![Tests](https://img.shields.io/badge/tests-186%2F186-success)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![License](https://img.shields.io/badge/license-GPL--3.0-blue)
+![License](https://img.shields.io/badge/license-GPL--3.0%20%7C%7C%20Commercial-blueviolet)
 ![Installer](https://img.shields.io/badge/installer-.exe%20%2B%20zip-success)
 ![Mode](https://img.shields.io/badge/mode-Express-brightgreen)
 ![Presets](https://img.shields.io/badge/presets-9-blueviolet)
+
+> ⚠️ **DUAL LICENSING** — Este proyecto usa licenciamiento dual.
+> **GPL-3.0-or-later** (open-source, copyleft) para uso personal/educativo/OSS, o
+> **Licencia Comercial** (royalty/% acordado) para producto closed-source / SaaS /
+> distribución comercial. Mirá [`LICENSE`](LICENSE) y [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).
 
 ---
 
@@ -269,23 +274,74 @@ runs/                      experimentos (gitignored)
 
 ---
 
-## Licencia
+## Licencia — Dual Licensing (v2.3+)
 
-**GPL-3.0-or-later** (copyleft). Ver [`LICENSE`](LICENSE).
+Este proyecto usa **dual licensing**: elegís el camino que se ajusta a tu caso de uso.
 
-En claro:
+### 🟢 Camino A — GPL-3.0-or-later (gratis, OSS / personal)
 
-- ✅ Podés usarlo, modificarlo y distribuirlo libremente, incluso comercialmente.
-- ✅ Podés contribuir vía PR (ver [`CONTRIBUTING.md`](CONTRIBUTING.md) y
-  añadirte en [`AUTHORS.md`](AUTHORS.md)).
-- 🔒 Si distribuís una versión modificada, **debe seguir siendo GPL-3.0**: no se permite
-  re-licenciarla bajo términos más restrictivos ni cerrarla source-closed.
-- 📝 Debés preservar los avisos de copyright y créditos de los autores.
+**Para**: uso personal, educativo, investigación, hobbyistas, proyectos OSS.
 
-Las matemáticas de los algoritmos de dithering son dominio público (Floyd-Steinberg
-1976, Jarvis 1976, Stucki 1981, Atkinson 1986, Burkes 1988, Sierra 1989,
-Ulichney void-and-cluster 1993). Implementación propia desde los papers; no se copió
-código propietario.
+- ✅ Podés usarlo, modificarlo, distribuirlo y **usarlo en tu taller para grabar
+  para clientes** (el grabado es el producto, no el software).
+- ✅ Podés contribuir vía PR (ver [`CONTRIBUTING.md`](CONTRIBUTING.md)).
+- 🔒 **Cualquier trabajo derivado distribuido** DEBE seguir siendo GPL-3.0
+  (copyleft). No se permite cerrarlo source-closed ni redistribuirlo bajo otra
+  licencia.
+- 📝 Debés preservar los avisos de copyright + agregar tus cambios al
+  `CHANGELOG.md` si distribuís un fork.
+
+Ver el texto legal completo en [`LICENSE`](LICENSE).
+
+### 🔴 Camino B — Commercial License (paga, closed-source / SaaS / producto)
+
+**REQUERIDO si**:
+- Vas a vender un **producto físico** (ej. máquina láser con software embebido).
+- Vas a ofrecer un **SaaS / servicio web** que use este software internamente.
+- Vas a integrar el código en un producto **closed-source** sin liberar el tuyo
+  bajo GPL-3.0.
+- Tu organización tiene **políticas anti-GPL** (común en corporaciones).
+- Vas a **distribuir comercialmente** el software o un trabajo derivado.
+
+**Cómo funciona**:
+- Negociás términos con el copyright holder (Vahlame): royalty %, fee anual,
+  o pago único según volumen.
+- Templates de términos típicos: **3–12% royalty** sobre ventas/MRR, o
+  **USD 500–5,000/año** según tamaño de empresa.
+- Acuerdo escrito firmado por ambas partes antes de uso comercial.
+
+Ver detalles completos y cómo contactar en [`LICENSE-COMMERCIAL.md`](LICENSE-COMMERCIAL.md).
+
+> **⚠️ AVISO**: usar el software comercialmente **SIN** acordar la licencia
+> comercial Y **SIN** liberar tu código completo bajo GPL-3.0 constituye
+> violación de copyright. Por favor consultá antes de empezar.
+
+### 🤝 Casos comunes — qué licencia te aplica
+
+| Caso | Licencia |
+|---|---|
+| Lo uso en mi taller para grabar piezas para mis clientes | **GPL-3.0** ✅ (gratis) |
+| Tengo un sitio web donde clientes suben fotos y reciben PNGs procesados | **Commercial** 🔴 |
+| Lo modifiqué para mi uso interno en mi empresa de < 10 personas | **GPL-3.0** ✅ si no distribuís el binary; **Commercial** 🔴 si lo distribuís |
+| Vendo una máquina láser con este software pre-instalado | **Commercial** 🔴 |
+| Hago un fork open-source con mejoras y lo subo a GitHub bajo GPL-3.0 | **GPL-3.0** ✅ |
+| Doy un curso pago de grabado láser usando este software como herramienta | **GPL-3.0** ✅ (no es distribución del software) |
+| Vendo plantillas / archivos PNG generados con el software | **GPL-3.0** ✅ (el output PNG no es trabajo derivado del software) |
+
+### 📐 Algoritmos científicos vs implementación
+
+Las **matemáticas** de los algoritmos de dithering están en dominio público
+(Floyd-Steinberg 1976, Jarvis 1976, Stucki 1981, Atkinson 1986, Burkes 1988,
+Sierra 1989, Ulichney void-and-cluster 1993). Cualquiera puede implementar
+estos algoritmos desde los papers originales — eso no infringe nuestro copyright.
+
+Lo que **SÍ** está protegido por copyright de Vahlame + colaboradores:
+- La **implementación específica** en Python (incluyendo optimizaciones numba JIT).
+- El **auto-detector con 5 reglas** + presets curados (`photo_high_detail`,
+  `cartoon_back_engrave`, etc.) — validación empírica original del proyecto.
+- El **score v5** (HVS-MSE + spectral + edge preservation + multi-scale tone).
+- El **wizard SvelteKit** y toda la integración FastAPI.
+- El **plain_region_simplification** + auto-mirror + integraciones LightBurn.
 
 ---
 
