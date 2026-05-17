@@ -613,6 +613,51 @@ def test_auto_mirror_applied_for_back_engrave_material():
         )
 
 
+def test_auto_mirror_header_reports_state():
+    """v2.2: X-Auto-Mirrored header debe reportar el estado real del flip.
+
+    El frontend usa este header para mostrar el aviso "MirrorX desactivado en LightBurn"
+    y evitar el bug de doble-mirror.
+    """
+    api = _load_api_app()
+    from fastapi.testclient import TestClient
+    img_bytes = _make_synthetic_image(w=200, h=100)
+
+    with TestClient(api.app) as client:
+        # back_engrave + auto_mirror=True → header debe ser "true"
+        r1 = client.post("/api/process",
+            files={"image": ("x.jpg", img_bytes, "image/jpeg")},
+            data={"params_json": json.dumps({
+                "material": "acrylic_back_engrave",
+                "quality_mode": "fast", "max_side": 200,
+                "auto_mirror_back_engrave": True,
+            })})
+        assert r1.status_code == 200
+        assert r1.headers.get("X-Auto-Mirrored") == "true"
+
+        # back_engrave + auto_mirror=False → header debe ser "false"
+        r2 = client.post("/api/process",
+            files={"image": ("x.jpg", img_bytes, "image/jpeg")},
+            data={"params_json": json.dumps({
+                "material": "acrylic_back_engrave",
+                "quality_mode": "fast", "max_side": 200,
+                "auto_mirror_back_engrave": False,
+            })})
+        assert r2.status_code == 200
+        assert r2.headers.get("X-Auto-Mirrored") == "false"
+
+        # wood (no back_engrave) → header debe ser "false" (no se aplicó mirror)
+        r3 = client.post("/api/process",
+            files={"image": ("x.jpg", img_bytes, "image/jpeg")},
+            data={"params_json": json.dumps({
+                "material": "wood_generic",
+                "quality_mode": "fast", "max_side": 200,
+                "auto_mirror_back_engrave": True,
+            })})
+        assert r3.status_code == 200
+        assert r3.headers.get("X-Auto-Mirrored") == "false"
+
+
 def test_auto_mirror_NO_applied_for_wood_material():
     """v2.0: wood NO termina en '_back_engrave', no debe espejar."""
     api = _load_api_app()

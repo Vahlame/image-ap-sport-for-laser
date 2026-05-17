@@ -4,6 +4,65 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [2.2.0] — 2026-05-16
+
+### Cierre de auditoría — los bugs de severidad baja/media restantes
+
+v2.1 cubrió los críticos. v2.2 cierra los 6 bugs restantes del audit + UX
+mejoras adicionales.
+
+### Backend (`scripts/api_server.py`)
+
+**Bug ALTA — Auto-mirror double-apply** (`api_server.py`):
+- El PNG se espejaba automáticamente para back-engrave pero el frontend no tenía
+  forma de saberlo → usuario podía aplicar MirrorX en LightBurn provocando un
+  doble-mirror que arruina el grabado.
+- Fix: header `X-Auto-Mirrored: "true"|"false"` reportado en cada response.
+  Agregado a `expose_headers` del CORS para que sea legible desde el frontend.
+- Frontend muestra aviso visual cuando `autoMirrored=true`: "NO actives MirrorX
+  en LightBurn — el PNG ya está listo para Pass-Through."
+- Test: `test_auto_mirror_header_reports_state` (3 escenarios: true/false/wood).
+
+**Doc — CORS warning para production**:
+- Comentario explícito antes de `app.add_middleware(CORSMiddleware,...)` con
+  checklist de seguridad: agregar auth, no usar "*", rate-limiting, etc.
+
+### Frontend (`web/src/`)
+
+**Bug MEDIA — `cancelJob` no actualizaba UI inmediatamente**:
+- Usuario hacía clic en "Cancelar" pero el botón quedaba "Cancelando…" hasta
+  que el roundtrip terminaba (~1-2s con SSE lento).
+- Fix: optimistic UI update — `expressProgress.stage = 'cancelling'` antes del
+  `await apiClient.cancelJob()`. El usuario ve feedback inmediato.
+
+**Bug MEDIA — `previewTimer` race condition en $effect**:
+- Si el componente desmontaba o cambiaba step entre el `setTimeout` y su
+  callback, `runPreview()` podía dispararse en estado inválido.
+- Fix: guard `if (previewTimer !== null)` + reset a `null` después del clear.
+  Early-return también limpia el timer pendiente.
+
+**Bug BAJA — Drag-drop sin feedback visual**:
+- Arrastrar un archivo sobre el dropzone no daba indicación visual.
+- Fix: handlers `ondragover/ondragleave/ondrop` agregan/quitan clase `.drag-active`
+  con estilo: border accent + glow + scale(1.01) para feedback claro.
+
+### Tests (`tests/conftest.py`)
+
+**Mejora — Garbage collection autouse fixture**:
+- Tests largos (HQ refine con stock images) acumulaban memoria afectando tests
+  posteriores.
+- Fix: `_gc_after_each_test` autouse fixture corre `gc.collect()` tras cada test
+  (~5ms overhead, libera Image/numpy buffers).
+- Documentación del `stock_cache_dir`: `tmp_path_factory.mktemp()` ya auto-limpia
+  con pytest config default; instrucciones para invalidar cache manualmente.
+
+### Tests nuevos (1)
+
+- `test_auto_mirror_header_reports_state` — verifica X-Auto-Mirrored para 3
+  escenarios (acrylic_back_engrave + auto=true/false, wood_generic + auto=true).
+
+**186 tests totales** (+1 nuevo), todos verdes.
+
 ## [2.1.0] — 2026-05-16
 
 ### Bug fix urgente — Descargar imagen no funcionaba

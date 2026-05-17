@@ -1,6 +1,6 @@
 [project]
 name = "image-ap-sport-for-laser"
-version = "2.1.0"
+version = "2.2.0"
 description = "Image-to-PNG laser preparation: Express mode + auto-presets + HQ refinement + LightBurn recommendations"
 license = { text = "GPL-3.0-or-later" }
 readme = "README.md"

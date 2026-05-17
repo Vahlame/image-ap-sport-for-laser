@@ -156,11 +156,20 @@
 
 	async function cancelExpressJob() {
 		if (!expressJobId) return;
+		// v2.2: actualizar UI inmediatamente para que el usuario vea "Cancelando…"
+		// sin esperar el roundtrip al server. Si el cancel API call falla, el polling
+		// SSE eventualmente devuelve el estado real.
 		expressCancelled = true;
+		if (expressProgress) {
+			// Optimistic UI update: mostrar "cancelled" en el log si el SSE tarda
+			expressProgress = { ...expressProgress, stage: 'cancelling' };
+		}
 		try {
 			await apiClient.cancelJob(expressJobId);
 		} catch (err) {
-			console.warn('cancel job:', err);
+			// Si el cancel falla, dejamos que el SSE/polling actualice el estado real.
+			// No mostrar error al usuario porque el cancel es best-effort.
+			console.warn('[cancelJob] HTTP cancel failed (job puede haber terminado):', err);
 		}
 	}
 
@@ -320,11 +329,26 @@
 			params.gamma, params.autocontrast, params.sharpen, params.invert,
 			params.preprocess_mode, params.material, step
 		];
-		if (!croppedBlob || step < 3 || !backendOnline) return;
-		if (previewTimer) clearTimeout(previewTimer);
-		previewTimer = setTimeout(runPreview, 350);
+		// v2.2: guard early-return TAMBIÉN limpia el timer existente para evitar
+		// que runPreview() dispare en condiciones que ya no aplican (paso < 3,
+		// blob eliminado, backend offline).
+		if (!croppedBlob || step < 3 || !backendOnline) {
+			if (previewTimer !== null) {
+				clearTimeout(previewTimer);
+				previewTimer = null;
+			}
+			return;
+		}
+		if (previewTimer !== null) clearTimeout(previewTimer);
+		previewTimer = setTimeout(() => {
+			previewTimer = null;  // marcar como ejecutado para que cleanup no haga clear inválido
+			runPreview();
+		}, 350);
 		return () => {
-			if (previewTimer) clearTimeout(previewTimer);
+			if (previewTimer !== null) {
+				clearTimeout(previewTimer);
+				previewTimer = null;
+			}
 		};
 	});
 
@@ -635,7 +659,10 @@
 						(material <code>{myConfig.material || '—'}</code>, {myConfig.output_mm_short}mm @ {myConfig.output_dpi}DPI)
 						+ auto-detección de preset + HQ refinement. Tarda ~2–3 minutos por imagen full-res.
 					</p>
-					<label class="dropzone dropzone-express">
+					<label class="dropzone dropzone-express"
+					       ondragover={(e) => { e.preventDefault(); (e.currentTarget as HTMLElement).classList.add('drag-active'); }}
+					       ondragleave={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-active')}
+					       ondrop={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-active')}>
 						<input type="file" accept="image/png,image/jpeg,image/webp"
 						       onchange={onExpressDropzoneChange}
 						       disabled={processingFull || !myConfig.material} />
@@ -784,7 +811,10 @@
 					<p class="lede">
 						Subí una foto nítida. En el siguiente paso elegís el recorte y después tunear con sliders.
 					</p>
-					<label class="dropzone">
+					<label class="dropzone"
+					       ondragover={(e) => { e.preventDefault(); (e.currentTarget as HTMLElement).classList.add('drag-active'); }}
+					       ondragleave={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-active')}
+					       ondrop={(e) => (e.currentTarget as HTMLElement).classList.remove('drag-active')}>
 						<input type="file" accept="image/png,image/jpeg,image/webp" onchange={onDropzoneChange} />
 						<span class="dropzone-icon" aria-hidden="true">
 							<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
@@ -1028,6 +1058,14 @@
 					{#if finalMeta.material}· LUT <code>{finalMeta.material}</code>{/if}
 				</p>
 
+				{#if finalMeta.autoMirrored}
+					<!-- v2.2: aviso explícito de auto-mirror para evitar doble-mirror en LightBurn -->
+					<p class="mirror-notice">
+						🪞 <strong>PNG ya viene espejado horizontalmente</strong> (acrílico back-engrave).
+						En LightBurn: <strong>NO actives MirrorX</strong> — el PNG ya está listo para Pass-Through.
+					</p>
+				{/if}
+
 				<div class="result-grid">
 					<figure>
 						<figcaption>PNG laser-ready (1-bit)</figcaption>
@@ -1257,6 +1295,18 @@
 	.hint { color: var(--text-faint); font-size: 0.82rem; margin: 0.4rem 0 0; }
 	.warn { color: var(--warn); background: rgba(240, 198, 74, 0.06); border-left: 3px solid var(--warn); padding: 0.5rem 0.7rem; border-radius: 4px; font-size: 0.85rem; margin: 0.5rem 0; }
 
+	/* v2.2: aviso de auto-mirror para evitar doble-mirror en LightBurn */
+	.mirror-notice {
+		margin: 0.8rem 0;
+		padding: 0.7rem 1rem;
+		background: rgba(94, 163, 220, 0.10);
+		border-left: 3px solid #5ea3dc;
+		border-radius: 6px;
+		color: var(--text);
+		font-size: 0.88rem;
+	}
+	.mirror-notice strong { color: var(--accent); }
+
 	/* v2.1: tarjeta de error con botón retry */
 	.error-card {
 		margin-top: 0.8rem;
@@ -1285,6 +1335,13 @@
 	.dropzone:hover {
 		border-color: var(--accent);
 		background: rgba(142, 224, 107, 0.04);
+	}
+	/* v2.2: feedback visual durante drag-over */
+	.dropzone.drag-active {
+		border-color: var(--accent);
+		background: rgba(142, 224, 107, 0.12);
+		box-shadow: 0 0 24px var(--accent-glow);
+		transform: scale(1.01);
 	}
 	.dropzone input { display: none; }
 	.dropzone-icon { color: var(--accent); }

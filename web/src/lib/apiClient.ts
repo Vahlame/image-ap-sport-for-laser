@@ -196,6 +196,9 @@ export interface ProcessMeta {
 	processTimeMs: number;
 	sharpenRadiusPx: number;
 	material: string;
+	/** v2.2: true si el PNG ya viene espejado (back-engrave). El usuario NO debe
+	 *  activar MirrorX en LightBurn cuando esto es true (evita doble-mirror). */
+	autoMirrored?: boolean;
 }
 
 /** Entrada del log estructurado del worker (t es segundos relativos al inicio del job). */
@@ -361,7 +364,8 @@ export const apiClient = {
 			whiteRatio: parseFloat(res.headers.get('X-White-Ratio') ?? '0'),
 			processTimeMs: parseFloat(res.headers.get('X-Process-Time-Ms') ?? '0'),
 			sharpenRadiusPx: parseFloat(res.headers.get('X-Sharpen-Radius-Px') ?? '0'),
-			material: res.headers.get('X-Material') ?? ''
+			material: res.headers.get('X-Material') ?? '',
+			autoMirrored: res.headers.get('X-Auto-Mirrored') === 'true'
 		};
 		return { blob, meta };
 	},
@@ -544,7 +548,8 @@ export const apiClient = {
 			whiteRatio: parseFloat(resultRes.headers.get('X-White-Ratio') ?? '0'),
 			processTimeMs: parseFloat(resultRes.headers.get('X-Process-Time-Ms') ?? '0'),
 			sharpenRadiusPx: parseFloat(resultRes.headers.get('X-Sharpen-Radius-Px') ?? '0'),
-			material: resultRes.headers.get('X-Material') ?? ''
+			material: resultRes.headers.get('X-Material') ?? '',
+			autoMirrored: resultRes.headers.get('X-Auto-Mirrored') === 'true'
 		};
 		return { blob, meta, jobId };
 	}

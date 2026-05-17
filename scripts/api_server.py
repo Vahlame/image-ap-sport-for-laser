@@ -590,6 +590,20 @@ app = FastAPI(
     version="1.0.0",
 )
 
+#  ⚠️  SEGURIDAD (LEER ANTES DE EXPONER PÚBLICAMENTE):
+#  Este servidor NO tiene autenticación. La configuración CORS abajo permite
+#  orígenes localhost porque es uso single-user en localhost. Si vas a exponer
+#  esto en red corporativa o pública:
+#
+#    1. Agregar autenticación (FastAPI tiene OAuth2/JWT support).
+#    2. Cambiar allow_origins a la lista exacta de orígenes permitidos
+#       (NO usar "*" — eso permite que cualquier sitio te haga upload).
+#    3. Considerar rate-limiting (slowapi o nginx proxy).
+#    4. Limitar MAX_UPLOAD_BYTES más agresivamente para evitar DoS.
+#    5. Loggear todas las requests para auditoría.
+#
+#  Para uso normal (localhost only via .bat launcher) la configuración default
+#  es segura porque el bind es 127.0.0.1 (no accesible desde la red).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -607,6 +621,7 @@ app.add_middleware(
         "X-Sharpen-Radius-Px", "X-Material", "X-Preset-Applied", "X-Algorithm",
         "X-Quality-Mode", "X-Refine-Candidates", "X-Refine-Best-Score",
         "X-Refine-Improvement", "X-Refine-Seconds", "X-Preset-Reason",
+        "X-Auto-Mirrored",  # v2.2
         "X-Sim-Sigma-Px", "X-Sim-Spot-Mm", "X-Sim-Dpi",
         "Content-Disposition",
     ],
@@ -744,6 +759,10 @@ def _build_result_headers(
         "X-Preset-Applied": applied_preset or "",
         "X-Algorithm": meta.get("winning_algorithm") or fallback_algorithm,
         "X-Quality-Mode": meta.get("quality_mode", "fast"),
+        # v2.2: header explícito para que el frontend sepa que el PNG ya viene
+        # con mirror aplicado. Si "true", el usuario NO debe activar MirrorX
+        # en LightBurn (evita doble-mirror).
+        "X-Auto-Mirrored": "true" if meta.get("auto_mirrored") else "false",
         "Content-Disposition": f'attachment; filename="laser_ready_{meta.get("winning_algorithm") or fallback_algorithm}.png"',
     }
     if meta.get("refine"):
