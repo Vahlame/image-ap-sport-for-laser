@@ -722,6 +722,210 @@ def niblack_preprocess_gray(gray: np.ndarray, window: int, k: float, blend: floa
     return np.clip(out, 0.0, 255.0)
 
 
+def apply_s_curve(gray: np.ndarray, strength: float = 0.5) -> np.ndarray:
+    """
+    Aplica curva en S al gris — técnica clásica del workflow profesional Photoshop/
+    PhotoGrav para fotos de laser engraving. Aclara midtones (~120-150 gray) y
+    oscurece sombras (~60-80) → más "punch" fotográfico.
+
+    Implementación: función sigmoide centrada en 128. `strength` controla la curvatura.
+      - strength=0: identidad (sin cambio)
+      - strength=0.5: S suave (default, equivalente a curve point [100,80]+[160,180])
+      - strength=1.0: S agresiva (riesgo de aplastar extremos)
+
+    Fórmula: out = 128 + (255/2) * tanh(strength * 4 * (gray-128)/128)
+    Equivalente a Levels/Curves S-shape de Photoshop con central pivot en 128.
+
+    Args:
+        gray: float64 [0, 255]
+        strength: [0, 1.5] curvatura (default 0.5)
+    Returns:
+        gray con S-curve aplicada, mismo dtype.
+    """
+    s = float(np.clip(strength, 0.0, 1.5))
+    if s < 1e-6:
+        return gray  # identidad
+    g_norm = (gray.astype(np.float64) - 128.0) / 128.0  # [-1, 1]
+    # tanh con factor de strength: a mayor s, más S-shape pronunciada
+    g_out = np.tanh(s * 4.0 * g_norm)
+    return np.clip(128.0 + 127.5 * g_out, 0.0, 255.0)
+
+
+def apply_local_contrast(
+    gray: np.ndarray,
+    radius_px: float = 60.0,
+    amount_pct: float = 15.0,
+) -> np.ndarray:
+    """
+    Local contrast enhancement (a.k.a. "Clarity" en Lightroom, "Punch" en PhotoGrav).
+    Es Unsharp Mask con radius MUY GRANDE (30-100 px) + amount BAJO (5-20%) — opuesto
+    al unsharp tradicional (radius 1-2 px + amount 50-100%).
+
+    Resultado: aumenta el "punch" del rango medio sin afectar los detalles finos
+    (que son resaltados por el unsharp_mask tradicional). Combinado con S-curve,
+    da el look fotorrealista profesional para grabado láser.
+
+    Diferencia vs CLAHE: CLAHE redistribuye histograma local (más agresivo, puede
+    amplificar ruido). Local contrast preserva el histograma global pero aumenta
+    contraste mid-frecuencia (más sutil, no amplifica ruido).
+
+    Args:
+        gray: float64 [0, 255]
+        radius_px: radio del blur Gaussian (30-100 típico, default 60)
+        amount_pct: porcentaje del enhancement (5-25 típico, default 15)
+    Returns:
+        gray con local contrast, mismo dtype.
+    """
+    amt = float(amount_pct) / 100.0
+    if amt < 1e-6 or radius_px < 1.0:
+        return gray
+    # Gaussian blur con sigma derivado del radius (radius ≈ 2-3 σ típicamente)
+    sigma = float(radius_px) / 2.5
+    from scipy.ndimage import gaussian_filter as _gauss
+    blurred = _gauss(gray.astype(np.float64), sigma=sigma, mode="reflect")
+    # Unsharp con amount: out = gray + amount * (gray - blurred)
+    enhanced = gray.astype(np.float64) + amt * (gray.astype(np.float64) - blurred)
+    return np.clip(enhanced, 0.0, 255.0)
+
+
+def plain_region_simplification(
+    gray: np.ndarray,
+    window: int = 9,
+    var_threshold: float = 25.0,
+    bright_threshold: float = 220.0,
+    dark_threshold: float = 35.0,
+    min_region_size: int = 64,
+    morph_cleanup: bool = True,
+) -> np.ndarray:
+    """
+    Detecta regiones localmente uniformes (varianza baja) y las "clampea" a
+    blanco/negro puro ANTES del dither.
+
+    Motivo: en una foto típica de grabado láser, el cielo gris o fondo blanco
+    se halftone-ea generando un patrón moteado que:
+      1. No aporta información visual (es ruido).
+      2. Hace que el láser haga MILES de pulsos innecesarios → desgaste del tubo +
+         tiempo de grabado + posible marca visible en material claro.
+
+    Estrategia:
+      - Calcular varianza local en ventana `window` x `window`.
+      - Donde varianza < `var_threshold` AND gray > `bright_threshold` → candidato a 255 (blanco)
+      - Donde varianza < `var_threshold` AND gray < `dark_threshold` → candidato a 0 (negro)
+      - **Morphological cleanup** (v1.7): elimina "manchas" chicas en zonas no-uniformes
+        (ej. bokeh con luces puntuales) y rellena huecos chicos en zonas uniformes
+        (ej. ruido de cámara) — esto evita los artefactos "stamping" visibles en
+        cielos con gradientes sutiles.
+
+    NO toca zonas con detalle (varianza alta) ni grises medios (que necesitan halftone real).
+
+    Args:
+        gray: float64 [0, 255] (post-LUT idealmente).
+        window: tamaño de ventana para varianza local (default 9 = 3x sub-tile de Sauvola).
+        var_threshold: varianza local mínima para considerar "no plano" (default 25 ≈ σ=5).
+        bright_threshold: gris mínimo para "zona clara" (default 220 = ~86% blanco).
+        dark_threshold: gris máximo para "zona oscura" (default 35 = ~14% negro).
+        min_region_size: tamaño mínimo de región (en px) para clampear. Regiones más
+            chicas se descartan — evita el "stamping" de manchas chicas. Default 64.
+        morph_cleanup: si True (default), aplica binary_opening (descarta < min_size)
+            seguido de binary_closing (rellena huecos chicos) sobre las máscaras.
+
+    Returns:
+        gray simplificado, mismo dtype/shape que input.
+    """
+    from scipy import ndimage as _ndi
+    w = max(3, int(window) | 1)
+    if w % 2 == 0:
+        w += 1
+    g = gray.astype(np.float64)
+    if g.max() > 1.0:
+        g_norm = g
+    else:
+        g_norm = g * 255.0  # asumir [0,1] y escalar
+
+    m = uniform_filter(g_norm, size=w, mode="nearest")
+    m2 = uniform_filter(g_norm * g_norm, size=w, mode="nearest")
+    var = np.maximum(m2 - m * m, 0.0)
+
+    plain_mask = var < float(var_threshold)
+    bright_plain = plain_mask & (g_norm > float(bright_threshold))
+    dark_plain = plain_mask & (g_norm < float(dark_threshold))
+
+    if morph_cleanup:
+        # Eliminar regiones más chicas que min_region_size: previene manchas
+        # aisladas en gradientes complejos (bokeh, cielos nublados).
+        bright_plain = _filter_small_regions(bright_plain, int(min_region_size))
+        dark_plain = _filter_small_regions(dark_plain, int(min_region_size))
+        # Cerrar huecos chicos dentro de regiones uniformes (ruido de cámara JPEG).
+        # border_value=1 evita el edge-erosion bug que come bordes de imágenes
+        # totalmente uniformes (binary_closing default deja un borde de 1 px).
+        struct = np.ones((3, 3), dtype=bool)
+        bright_plain = _ndi.binary_closing(bright_plain, structure=struct, iterations=1, border_value=1)
+        dark_plain = _ndi.binary_closing(dark_plain, structure=struct, iterations=1, border_value=1)
+
+    out = g_norm.copy()
+    out[bright_plain] = 255.0
+    out[dark_plain] = 0.0
+    return np.clip(out, 0.0, 255.0)
+
+
+def _filter_small_regions(mask: np.ndarray, min_size: int) -> np.ndarray:
+    """Helper: descarta componentes conectados con menos de min_size pixels."""
+    from scipy import ndimage as _ndi
+    labeled, n = _ndi.label(mask)
+    if n == 0:
+        return mask
+    sizes = _ndi.sum(mask, labeled, range(1, n + 1))
+    # Keep only labels with size >= min_size
+    keep = np.zeros(n + 1, dtype=bool)
+    keep[1:] = sizes >= float(min_size)
+    return keep[labeled]
+
+
+def clahe_preprocess_gray(
+    gray: np.ndarray,
+    clip_limit: float = 2.5,
+    tile_size: int = 8,
+    blend: float = 0.6,
+) -> np.ndarray:
+    """
+    CLAHE (Contrast Limited Adaptive Histogram Equalization) — preserva detalles
+    en zonas extremas (muy claras o muy oscuras) antes del dither.
+
+    Útil para el caso "logo Red Bull en capó blanco": el toro pierde forma porque
+    el dither no tiene "presupuesto" de puntos negros en una región uniformemente
+    clara. CLAHE redistribuye localmente el histograma para que el contraste local
+    del detalle suba antes de que el dither decida.
+
+    - `clip_limit`: cuanto mayor, más agresivo (default 2.5 = moderado, no produce
+      halos visibles ni amplifica ruido excesivamente).
+    - `tile_size`: tamaño del tile en píxeles del lado corto del ranking (default 8).
+      El algoritmo lo escala según tile_grid_size = imagen / tile_size.
+    - `blend`: 0=sin efecto, 1=full CLAHE. Default 0.6 = sutil pero efectivo para
+      grabado láser.
+
+    Implementación: skimage.exposure.equalize_adapthist (port Reza 2004 + Pizer 1987).
+    """
+    from skimage.exposure import equalize_adapthist
+    g = gray.astype(np.float64)
+    if g.max() > 1.0:
+        g_norm = g / 255.0
+    else:
+        g_norm = g.copy()
+    # equalize_adapthist espera float en [0,1]; tile-grid se calcula como imagen/tile_size
+    h, w = g_norm.shape
+    ny = max(2, h // max(1, int(tile_size) * 8))
+    nx = max(2, w // max(1, int(tile_size) * 8))
+    enhanced = equalize_adapthist(
+        np.clip(g_norm, 0.0, 1.0),
+        kernel_size=(max(8, h // ny), max(8, w // nx)),
+        clip_limit=float(np.clip(clip_limit / 10.0, 0.001, 1.0)),  # skimage normaliza distinto
+    )
+    enhanced = enhanced * 255.0
+    b = float(np.clip(blend, 0.0, 1.0))
+    out = (1.0 - b) * g + b * enhanced
+    return np.clip(out, 0.0, 255.0)
+
+
 def grabcut_preprocess_gray(
     rgb: np.ndarray,
     gray: np.ndarray,

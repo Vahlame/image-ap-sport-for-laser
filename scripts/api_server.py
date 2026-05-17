@@ -28,9 +28,12 @@ Acceso desde el wizard:
 
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +49,12 @@ import laser_scoring
 import laser_physics
 import laser_simulator
 import laser_presets
+from laser_jobs import REGISTRY, JobState
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import JSONResponse, Response
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
     from pydantic import BaseModel, Field
 except ImportError as exc:
     raise SystemExit(
@@ -88,8 +92,41 @@ class ProcessParams(BaseModel):
     sharpen: float = Field(default=40.0, ge=0, le=300)
     sharpen_radius_mm: float = Field(default=0.10, ge=0.01, le=2.0)
     invert: bool = Field(default=True)
-    preprocess_mode: str = Field(default="sauvola", description="Pre-CV: none|sauvola|niblack|grabcut|chanvese|sam2")
+    preprocess_mode: str = Field(default="sauvola", description="Pre-CV: none|sauvola|niblack|clahe|sauvola_clahe|grabcut|chanvese|sam2")
     max_side: int = Field(default=0, ge=0, le=8000, description="0 = no resize (full-res). Preview pasa 400.")
+    simplify_plain_regions: bool = Field(
+        default=True,
+        description="Si True (default), detecta zonas localmente uniformes (cielo, fondos planos) "
+        "y las clampea a blanco/negro puro antes del dither. Reduce ruido moteado en el grabado "
+        "y ahorra pulsos del láser. Desactivar para preservar texturas sutiles en fondos.",
+    )
+    s_curve_strength: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.5,
+        description="Curva en S tonal (0=sin, 0.5=suave, 1.0=agresiva). Aclara midtones y "
+        "oscurece sombras → look fotorrealista profesional. Técnica estándar Photoshop/PhotoGrav.",
+    )
+    local_contrast_amount: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=50.0,
+        description="Local contrast enhancement % (a.k.a. 'Clarity'). Unsharp Mask con radius "
+        "grande (60px) + amount bajo (default 0=sin, 5-20 típico). Aumenta 'punch' fotográfico "
+        "sin amplificar ruido como CLAHE.",
+    )
+    auto_mirror_back_engrave: bool = Field(
+        default=True,
+        description="Si True (default) y material termina en '_back_engrave', voltea el PNG "
+        "final horizontalmente. PhotoGrav lo hace automáticamente porque al grabar en la cara "
+        "POSTERIOR del acrílico, hay que invertir para que se vea correcto desde el frente.",
+    )
+    score_version: str = Field(
+        default="v5",
+        description="Métrica de calidad para HQ refine: 'v5' (no-reference, CPU rápido, default) "
+        "o 'v4' (LPIPS perceptual, requiere torch+lpips, usa GPU si está disponible). "
+        "v4 genera auto-target binario por threshold-50 del gris.",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -165,10 +202,30 @@ def _apply_preprocess(base_gray: np.ndarray, mode: str) -> np.ndarray:
         return ltm.sauvola_preprocess_gray(base_gray, window=15, k=0.15, R=128.0, blend=0.35)
     if mode == "niblack":
         return ltm.niblack_preprocess_gray(base_gray, window=15, k=-0.2, blend=0.35)
+    if mode == "clahe":
+        # CLAHE adaptativo: usa blend dinámico según std de la imagen para evitar
+        # over-enhance de bokehs (std bajo = imagen suave/desenfocada → blend menor;
+        # std alto = imagen con detalle distribuido → blend completo).
+        std = float(base_gray.std())
+        if std < 50.0:
+            # Imagen suave (bokeh, lighting controlado): CLAHE leve
+            blend = 0.30
+        elif std < 70.0:
+            blend = 0.45
+        else:
+            blend = 0.60  # imagen con mucho detalle: CLAHE completo
+        return ltm.clahe_preprocess_gray(base_gray, clip_limit=2.5, tile_size=8, blend=blend)
+    if mode == "sauvola_clahe":
+        # Pipeline 2-pass: primero CLAHE para revelar detalles, después Sauvola para
+        # contraste local refinado. Mejor para imágenes con detalles importantes
+        # en zonas extremas (claras o oscuras).
+        clahe = ltm.clahe_preprocess_gray(base_gray, clip_limit=2.0, tile_size=8, blend=0.5)
+        return ltm.sauvola_preprocess_gray(clahe, window=15, k=0.15, R=128.0, blend=0.30)
     # grabcut/chanvese/sam2 requieren mas args; los exponemos como preprocess avanzado en CLI
     raise HTTPException(
         status_code=400,
-        detail=f"preprocess_mode '{mode}' no soportado en API (usar CLI o uno de: none, sauvola, niblack)",
+        detail=f"preprocess_mode '{mode}' no soportado en API "
+        "(usar CLI o uno de: none, sauvola, niblack, clahe, sauvola_clahe)",
     )
 
 
@@ -247,25 +304,28 @@ def _resolve_preset_overrides(params: ProcessParams, img_rgb: Image.Image) -> tu
     return ProcessParams(**merged), preset_name, detector_reason
 
 
-def _hq_refine(base_gray: np.ndarray, base_params: ProcessParams) -> tuple[np.ndarray, dict, ltm.Candidate]:
+def _hq_refine(
+    base_gray: np.ndarray,
+    base_params: ProcessParams,
+    progress_cb: "Any | None" = None,
+    cancel_check: "Any | None" = None,
+) -> tuple[np.ndarray, dict, ltm.Candidate]:
     """
     HQ refinement: corre un sobol-search local (~24 variantes alrededor de los params dados)
     y devuelve el mejor por score v5 (no-reference: HVS-MSE + spectral radial + tone post-LUT).
 
-    Cuesta tiempo (~30-90s para imágenes full-res en CPU; menos con CUDA en LPIPS).
-
-    Sobol explora 5 dimensiones:
-        threshold ± 16
-        contrast ± 0.20
-        brightness ± 12
-        gamma ± 0.20
-        sharpen ± 30
+    Args:
+        base_gray: gris preprocesado.
+        base_params: parámetros base; variantes se generan alrededor.
+        progress_cb: callable opcional `(current, total, best_score, elapsed_seconds) -> None`
+            llamado tras evaluar cada candidato. Sirve para reportar progreso al cliente.
+        cancel_check: callable opcional `() -> bool` consultado entre candidatos. Si devuelve
+            True, aborta y devuelve el mejor encontrado hasta el momento.
 
     Returns: (best_binary_output, debug_dict, winning_candidate)
     """
     from scipy.stats import qmc
 
-    # base candidate
     base_cand = ltm.Candidate(
         algorithm=base_params.algorithm,
         invert=base_params.invert,
@@ -277,7 +337,7 @@ def _hq_refine(base_gray: np.ndarray, base_params: ProcessParams) -> tuple[np.nd
         sharpen=float(base_params.sharpen),
     )
 
-    # Sobol 5D, 24 puntos (siempre incluimos el baseline como punto 0)
+    # Sobol 5D, 24 puntos (no-warning con power_of_2=False; 24 elegidos para balance velocidad/cobertura).
     sobol = qmc.Sobol(d=5, seed=2026, scramble=True).random(24)
     variants: list[ltm.Candidate] = [base_cand]
     for s in sobol:
@@ -292,44 +352,100 @@ def _hq_refine(base_gray: np.ndarray, base_params: ProcessParams) -> tuple[np.nd
             autocontrast=base_cand.autocontrast, sharpen=sh,
         ))
 
-    # Score v5 sin referencia: usamos el base_gray como "gris ideal"
+    # Targets para el scorer. v5 (no-ref) sólo usa target_gray; v4 (LPIPS perceptual)
+    # necesita target_binary + density + edges. Como no tenemos un PNG "ideal" de referencia
+    # en el flujo Express, generamos un mock target_binary por threshold-128 del gris:
+    # es suficiente para que v4 corra y el LPIPS evalúe similitud perceptual entre el
+    # output y un proxy razonable del gris pretendido.
+    score_version = (base_params.score_version or "v5").lower()
     target_gray_v5 = base_gray.astype(np.float64)
-    dummy_binary = np.zeros_like(base_gray, dtype=np.uint8)
-    dummy_density = np.zeros((max(1, base_gray.shape[0] // 4), max(1, base_gray.shape[1] // 4)), dtype=np.float64)
-    dummy_edges = np.zeros_like(base_gray, dtype=np.float64)
+    if score_version == "v4":
+        target_binary = np.where(base_gray >= 128, 255, 0).astype(np.uint8)
+        # density a 1/4 resolución (convención v1-v4)
+        h_q, w_q = max(1, base_gray.shape[0] // 4), max(1, base_gray.shape[1] // 4)
+        from PIL import Image as _PILImage  # local import (PIL ya está arriba pero esto evita shadowing)
+        bin_pil = _PILImage.fromarray(target_binary, mode="L").resize((w_q, h_q), _PILImage.Resampling.LANCZOS)
+        target_density = (np.array(bin_pil, dtype=np.float64) / 255.0)
+        # edges via sobel sobre el gris
+        from scipy import ndimage as _ndi
+        gx = _ndi.sobel(base_gray.astype(np.float64), axis=1)
+        gy = _ndi.sobel(base_gray.astype(np.float64), axis=0)
+        target_edges = np.sqrt(gx * gx + gy * gy)
+    else:
+        target_binary = np.zeros_like(base_gray, dtype=np.uint8)
+        target_density = np.zeros((max(1, base_gray.shape[0] // 4), max(1, base_gray.shape[1] // 4)), dtype=np.float64)
+        target_edges = np.zeros_like(base_gray, dtype=np.float64)
+
+    # Min improvement: el HQ refine sólo cambia el baseline si el nuevo candidato es
+    # ≥ MIN_IMPROVEMENT mejor (5% relativo). Sin esto, refine puede moverse a un
+    # candidato sutilmente mejor en score pero con diferencias visuales adversas
+    # (caso observado en rally car: refine elegía contraste alto que comía detalles).
+    MIN_IMPROVEMENT_RATIO = 0.05
 
     best_score = float("inf")
     best_out: np.ndarray | None = None
     best_cand: ltm.Candidate | None = None
+    baseline_score = float("inf")
     scores_log: list[tuple[float, ltm.Candidate]] = []
+    cancelled = False
     t0 = time.perf_counter()
-    for cand in variants:
+    total = len(variants)
+    for i, cand in enumerate(variants, start=1):
+        if cancel_check is not None and cancel_check():
+            cancelled = True
+            break
         out = ltm.render_candidate(base_gray, cand)
         score, *_ = laser_scoring.score_candidate_dispatch(
-            "v5", out, target_gray_v5, dummy_binary, dummy_density, dummy_edges, cand,
+            score_version, out, target_gray_v5, target_binary, target_density, target_edges, cand,
         )
         scores_log.append((float(score), cand))
-        if score < best_score:
-            best_score = score
+        if i == 1:
+            # Primer candidato = baseline (params del preset, sin variar)
+            baseline_score = float(score)
+            best_score = float(score)
             best_out = out
             best_cand = cand
+        elif score < best_score:
+            # Aceptar refinement sólo si mejora MEANINGFUL (> MIN_IMPROVEMENT_RATIO%)
+            relative_improvement = (baseline_score - score) / (abs(baseline_score) + 1e-9)
+            if relative_improvement >= MIN_IMPROVEMENT_RATIO:
+                best_score = score
+                best_out = out
+                best_cand = cand
+        if progress_cb is not None:
+            try:
+                progress_cb(i, total, float(best_score), time.perf_counter() - t0)
+            except Exception:
+                # Errors in progress callback should not abort processing
+                pass
     elapsed = time.perf_counter() - t0
 
     assert best_out is not None and best_cand is not None
     debug = {
-        "candidates_evaluated": len(variants),
-        "best_score_v5": best_score,
-        "baseline_score_v5": scores_log[0][0],
-        "improvement_v5": scores_log[0][0] - best_score,
+        "candidates_evaluated": len(scores_log),
+        "candidates_total": total,
+        "score_version": score_version,
+        "best_score_v5": best_score,  # nombre legacy para clientes existentes; semántica = score elegido
+        "baseline_score_v5": scores_log[0][0] if scores_log else best_score,
+        "improvement_v5": (scores_log[0][0] - best_score) if scores_log else 0.0,
         "refine_seconds": elapsed,
+        "cancelled": cancelled,
     }
     return best_out, debug, best_cand
 
 
-def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndarray, dict]:
+def _process_image(
+    img_rgb: Image.Image,
+    params: ProcessParams,
+    progress_cb: "Any | None" = None,
+    cancel_check: "Any | None" = None,
+) -> tuple[np.ndarray, dict]:
     """
     Pipeline completo: resize -> preprocess -> apply LUT material -> render candidate.
     Devuelve (binario uint8, metadata dict).
+
+    Si `progress_cb` y `cancel_check` se pasan, se propagan al HQ refine para reportar
+    progreso de cada candidato evaluado y permitir cancelación temprana.
     """
     # Resize si max_side > 0
     w, h = img_rgb.size
@@ -347,6 +463,22 @@ def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndar
     )
     if lut_fn is not None:
         base_gray = lut_fn(base_gray.astype(np.uint8)).astype(np.float64)
+
+    # S-curve tonal: aclara midtones, oscurece sombras (workflow profesional).
+    # Aplicar ANTES del local_contrast para que actúe sobre tonos puros.
+    if params.s_curve_strength > 0:
+        base_gray = ltm.apply_s_curve(base_gray, strength=params.s_curve_strength)
+
+    # Local contrast enhancement: "Clarity"/PhotoGrav. Aumenta punch mid-frecuencia
+    # sin amplificar ruido como CLAHE.
+    if params.local_contrast_amount > 0:
+        base_gray = ltm.apply_local_contrast(base_gray, radius_px=60.0, amount_pct=params.local_contrast_amount)
+
+    # Plain region simplification: elimina dither moteado en zonas uniformes (cielo,
+    # fondos blancos). Aplica DESPUÉS de LUT para que las zonas extremas post-LUT
+    # se clampeen correctamente.
+    if params.simplify_plain_regions:
+        base_gray = ltm.plain_region_simplification(base_gray)
 
     # Configurar sharpen global (worker globals de ltm)
     ranking_short = int(min(base_gray.shape))
@@ -367,7 +499,9 @@ def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndar
     refine_debug: dict | None = None
     if quality_mode == "best":
         t0 = time.perf_counter()
-        out, refine_debug, winning_cand = _hq_refine(base_gray, params)
+        out, refine_debug, winning_cand = _hq_refine(
+            base_gray, params, progress_cb=progress_cb, cancel_check=cancel_check
+        )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         # Reportar los params reales que ganaron
         winning_algorithm = winning_cand.algorithm
@@ -389,6 +523,20 @@ def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndar
         winning_algorithm = cand.algorithm
         winning_threshold = cand.threshold
 
+    # Auto-mirror para back-engrave (PhotoGrav-style): si el material termina en
+    # "_back_engrave", voltear el PNG horizontalmente. Al grabar en la cara
+    # posterior del acrílico, hay que invertir para que se vea correcto desde el
+    # frente. Si el usuario ya está aplicando MirrorX en LightBurn, debe desactivar
+    # este flag para evitar doble-mirror.
+    mirrored = False
+    if (
+        params.auto_mirror_back_engrave
+        and profile is not None
+        and profile.name.endswith("_back_engrave")
+    ):
+        out = np.fliplr(out).copy()
+        mirrored = True
+
     meta = {
         "output_size": [int(out.shape[1]), int(out.shape[0])],
         "ranking_short_px": ranking_short,
@@ -400,6 +548,7 @@ def _process_image(img_rgb: Image.Image, params: ProcessParams) -> tuple[np.ndar
         "quality_mode": quality_mode,
         "winning_algorithm": winning_algorithm,
         "winning_threshold": winning_threshold,
+        "auto_mirrored": mirrored,
     }
     if refine_debug:
         meta["refine"] = refine_debug
@@ -422,10 +571,21 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173", "http://127.0.0.1:5173",  # Vite dev
         "http://localhost:4173", "http://127.0.0.1:4173",  # Vite preview
+        "http://localhost:18765", "http://127.0.0.1:18765",  # Static mount (mismo origen pero por las dudas)
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
+    # Cliente lee X-Process-Time-Ms, X-Output-Width, etc.; con allow_headers=["*"] solo
+    # se permite request — para que JS los lea hay que expose_headers explícito.
     allow_headers=["*"],
+    expose_headers=[
+        "X-Process-Time-Ms", "X-Output-Width", "X-Output-Height", "X-White-Ratio",
+        "X-Sharpen-Radius-Px", "X-Material", "X-Preset-Applied", "X-Algorithm",
+        "X-Quality-Mode", "X-Refine-Candidates", "X-Refine-Best-Score",
+        "X-Refine-Improvement", "X-Refine-Seconds", "X-Preset-Reason",
+        "X-Sim-Sigma-Px", "X-Sim-Spot-Mm", "X-Sim-Dpi",
+        "Content-Disposition",
+    ],
 )
 
 
@@ -546,25 +706,21 @@ def list_algorithms() -> list[AlgorithmGroup]:
     ]
 
 
-def _process_endpoint_body(image_bytes: bytes, params: ProcessParams) -> Response:
-    img = _load_image_from_bytes(image_bytes)
-    # Resolver preset (incluye auto-deteccion si preset=='auto')
-    resolved_params, applied_preset, detector_reason = _resolve_preset_overrides(params, img)
-    out, meta = _process_image(img, resolved_params)
-    buf = io.BytesIO()
-    Image.fromarray(out, mode="L").save(buf, format="PNG", optimize=True)
-    buf.seek(0)
+def _build_result_headers(
+    meta: dict, applied_preset: str, detector_reason: str, fallback_algorithm: str
+) -> dict[str, str]:
+    """Construye los headers HTTP que el cliente lee tras un /process exitoso."""
     headers = {
         "X-Process-Time-Ms": f"{meta['render_ms']:.1f}",
         "X-Output-Width": str(meta["output_size"][0]),
         "X-Output-Height": str(meta["output_size"][1]),
         "X-White-Ratio": f"{meta['white_ratio']:.4f}",
         "X-Sharpen-Radius-Px": f"{meta['resolved_sharpen_radius_px']:.3f}",
-        "X-Material": meta["material"],
-        "X-Preset-Applied": applied_preset,
-        "X-Algorithm": meta.get("winning_algorithm", resolved_params.algorithm),
+        "X-Material": meta.get("material") or "",
+        "X-Preset-Applied": applied_preset or "",
+        "X-Algorithm": meta.get("winning_algorithm") or fallback_algorithm,
         "X-Quality-Mode": meta.get("quality_mode", "fast"),
-        "Content-Disposition": f"attachment; filename=\"laser_ready_{meta.get('winning_algorithm', resolved_params.algorithm)}.png\"",
+        "Content-Disposition": f'attachment; filename="laser_ready_{meta.get("winning_algorithm") or fallback_algorithm}.png"',
     }
     if meta.get("refine"):
         r = meta["refine"]
@@ -573,10 +729,25 @@ def _process_endpoint_body(image_bytes: bytes, params: ProcessParams) -> Respons
         headers["X-Refine-Improvement"] = f"{r['improvement_v5']:.4f}"
         headers["X-Refine-Seconds"] = f"{r['refine_seconds']:.2f}"
     if detector_reason:
-        # Solo encabezados ASCII; trimmear acentos en valores via repr no es ideal,
-        # pero el cliente igual lo muestra como info. Encode-safe:
+        # HTTP headers ASCII-only; eliminar acentos del motivo en español sin perder el sentido.
         headers["X-Preset-Reason"] = detector_reason.encode("ascii", "ignore").decode("ascii")
-    return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
+    return headers
+
+
+def _encode_png(out: np.ndarray) -> bytes:
+    buf = io.BytesIO()
+    Image.fromarray(out, mode="L").save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _process_endpoint_body(image_bytes: bytes, params: ProcessParams) -> Response:
+    img = _load_image_from_bytes(image_bytes)
+    # Resolver preset (incluye auto-deteccion si preset=='auto')
+    resolved_params, applied_preset, detector_reason = _resolve_preset_overrides(params, img)
+    out, meta = _process_image(img, resolved_params)
+    png = _encode_png(out)
+    headers = _build_result_headers(meta, applied_preset, detector_reason, resolved_params.algorithm)
+    return Response(content=png, media_type="image/png", headers=headers)
 
 
 @app.post("/api/process")
@@ -685,6 +856,293 @@ async def simulate(
         "Content-Disposition": "attachment; filename=\"engraving_simulation.png\"",
     }
     return Response(content=buf.getvalue(), media_type="image/png", headers=headers)
+
+
+# ---------------------------------------------------------------------------
+# Procesamiento asíncrono con progreso por SSE
+# ---------------------------------------------------------------------------
+
+
+# Singleton psutil.Process del worker (necesario para que cpu_percent() mantenga su
+# baseline interno entre llamadas; un Process nuevo cada call devuelve 0.0).
+_PSUTIL_PROC: Any = None
+
+
+def _init_process_metrics() -> None:
+    """Inicializa el objeto psutil.Process global y dispara el baseline de cpu_percent."""
+    global _PSUTIL_PROC
+    try:
+        import psutil
+        if _PSUTIL_PROC is None:
+            _PSUTIL_PROC = psutil.Process()
+        # Primer call siempre devuelve 0; el siguiente medirá el % real
+        _PSUTIL_PROC.cpu_percent(interval=None)
+    except Exception:
+        _PSUTIL_PROC = None
+
+
+def _process_metrics() -> tuple[float | None, float | None]:
+    """
+    Devuelve (memoria_MB_RSS, cpu_pct) del proceso actual via psutil.
+
+    Si psutil no está instalado, devuelve (None, None) sin romper.
+    El cpu_pct es no-bloqueante (cached desde el último call al mismo objeto Process);
+    `_init_process_metrics()` debe llamarse antes para crear el singleton.
+    """
+    p = _PSUTIL_PROC
+    if p is None:
+        return None, None
+    try:
+        mem_mb = p.memory_info().rss / (1024 * 1024)
+        cpu = p.cpu_percent(interval=None)
+        return float(mem_mb), float(cpu)
+    except Exception:
+        return None, None
+
+
+def _run_job_in_thread(job_id: str, image_bytes: bytes, params: ProcessParams) -> None:
+    """
+    Worker (thread) que procesa la imagen y reporta progreso + telemetría al JobRegistry.
+
+    Se invoca desde el endpoint async via `asyncio.to_thread`. Toda la lógica
+    pesada (decode, preprocess, render, HQ refine) corre acá.
+    El JobState se manipula directamente (single-writer) y los readers (SSE/status)
+    leen consistentemente porque el registry mantiene la referencia bajo lock.
+    """
+    job = REGISTRY.get(job_id)
+    if job is None:
+        return  # creado y borrado entre medio; nada que hacer.
+
+    # Inicializar baseline del cpu_percent (sin esto la primera medición real es 0.0)
+    _init_process_metrics()
+
+    t_started = time.perf_counter()
+
+    def _set_stage(new_stage: str, msg: str | None = None) -> None:
+        job.stage = new_stage
+        if msg:
+            job.log(msg)
+        else:
+            job.log(f"stage → {new_stage}")
+        job.elapsed_seconds = time.perf_counter() - t_started
+        mem, cpu = _process_metrics()
+        if mem is not None:
+            job.memory_mb = mem
+        if cpu is not None:
+            job.cpu_pct = cpu
+        job.touch()
+
+    try:
+        job.status = "running"
+        job.log(f"job {job_id} iniciado (quality_mode={params.quality_mode})")
+        _set_stage("decode", "decodificando imagen…")
+
+        img = _load_image_from_bytes(image_bytes)
+        job.log(f"imagen {img.size[0]}×{img.size[1]} OK")
+        _set_stage("resolve_preset", "resolviendo preset…")
+        resolved_params, applied_preset, detector_reason = _resolve_preset_overrides(params, img)
+        if applied_preset:
+            job.log(f"preset aplicado: {applied_preset}" + (f" ({detector_reason})" if detector_reason else ""))
+        if resolved_params.material:
+            job.log(f"material: {resolved_params.material}")
+
+        # Setear total estimado (1 base + 24 sobol). El HQ refine confirma el total via cb.
+        job.total = 25
+        _set_stage("processing", f"procesando ({resolved_params.quality_mode})…")
+
+        # Estado para el callback: tiempo del último update para calcular delta
+        last_t = {"v": time.perf_counter(), "current": 0, "best": float("inf")}
+
+        def progress_cb(current: int, total: int, best_score: float, elapsed: float) -> None:
+            now = time.perf_counter()
+            delta = now - last_t["v"]
+            last_t["v"] = now
+            last_t["current"] = current
+
+            job.current = int(current)
+            job.total = int(total)
+            job.best_score = float(best_score)
+            job.elapsed_seconds = float(elapsed)
+            job.eta_seconds = (elapsed / max(1, current)) * max(0, total - current)
+            job.seconds_per_candidate = elapsed / max(1, current)
+            job.last_candidate_seconds = delta
+            job.stage = "refine"
+            job.push_score(best_score)
+
+            # Si el best_score mejoró, loguear el evento
+            if best_score < last_t["best"] - 1e-6:
+                job.log(f"#{current}/{total}: nuevo mejor score {best_score:.4f} (Δ={delta:.2f}s)")
+                last_t["best"] = best_score
+
+            mem, cpu = _process_metrics()
+            if mem is not None:
+                job.memory_mb = mem
+            if cpu is not None:
+                job.cpu_pct = cpu
+            job.touch()
+
+        def cancel_check() -> bool:
+            return bool(job.is_cancel_requested())
+
+        out, meta = _process_image(img, resolved_params, progress_cb=progress_cb, cancel_check=cancel_check)
+
+        if job.is_cancel_requested():
+            job.status = "cancelled"
+            job.stage = "cancelled"
+            job.elapsed_seconds = time.perf_counter() - t_started
+            job.log("cancelado por el cliente", kind="warn")
+            job.touch()
+            return
+
+        _set_stage("encode", "comprimiendo PNG final…")
+        png = _encode_png(out)
+        headers = _build_result_headers(meta, applied_preset, detector_reason, resolved_params.algorithm)
+        job.log(f"PNG {len(png) // 1024} KB, {meta['output_size'][0]}×{meta['output_size'][1]}")
+
+        job.image_bytes = png
+        job.image_headers = headers
+        if meta.get("refine"):
+            r = meta["refine"]
+            job.current = int(r.get("candidates_evaluated", 1))
+            job.total = int(r.get("candidates_total", 1))
+        else:
+            job.current = job.total = 1
+        job.elapsed_seconds = time.perf_counter() - t_started
+        job.eta_seconds = 0.0
+        job.stage = "done"
+        job.status = "done"
+        job.log(f"finalizado en {job.elapsed_seconds:.2f}s ✓")
+        mem, cpu = _process_metrics()
+        if mem is not None:
+            job.memory_mb = mem
+        job.touch()
+    except HTTPException as exc:
+        job.status = "error"
+        job.stage = "error"
+        job.error_message = f"{exc.status_code}: {exc.detail}"
+        job.elapsed_seconds = time.perf_counter() - t_started
+        job.log(f"HTTPException {exc.status_code}: {exc.detail}", kind="error")
+        job.touch()
+    except Exception as exc:  # pragma: no cover - red de seguridad
+        job.status = "error"
+        job.stage = "error"
+        job.error_message = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        job.elapsed_seconds = time.perf_counter() - t_started
+        job.log(f"error: {type(exc).__name__}: {exc}", kind="error")
+        job.touch()
+
+
+@app.post("/api/process_async")
+async def process_async(
+    image: UploadFile = File(...),
+    params_json: str = Form("{}"),
+) -> dict:
+    """
+    Procesa imagen en background y devuelve un `job_id` para seguir el progreso por SSE.
+
+    Cliente: POST aquí → recibís `{"job_id": "..."}`. Después abrir EventSource a
+    `/api/jobs/{job_id}/stream` para progreso y GET `/api/jobs/{job_id}/result` para el PNG.
+    """
+    try:
+        raw = json.loads(params_json)
+        if "quality_mode" not in raw:
+            raw["quality_mode"] = "best"
+        params = ProcessParams(**raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"params_json invalido: {exc}") from exc
+
+    image_bytes = await image.read()
+    # Validación temprana — si la imagen es inválida fallamos acá sin crear job.
+    try:
+        _load_image_from_bytes(image_bytes)
+    except HTTPException:
+        raise
+
+    job = REGISTRY.create(total=25)
+    # Disparamos el worker en thread separado (CPU-bound). Usamos to_thread para no
+    # bloquear el event loop. asyncio.create_task NO ejecuta — programa la coroutine.
+    asyncio.create_task(asyncio.to_thread(_run_job_in_thread, job.job_id, image_bytes, params))
+    return {"job_id": job.job_id, "status": job.status}
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str) -> dict:
+    """Snapshot puntual del estado de un job (sin streaming). Útil para polling simple."""
+    job = REGISTRY.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' no existe o expiró")
+    return job.to_progress_dict()
+
+
+@app.get("/api/jobs/{job_id}/stream")
+async def job_stream(job_id: str) -> StreamingResponse:
+    """
+    Stream Server-Sent Events con el progreso del job hasta que llegue a done/error/cancelled.
+
+    Cada evento es `data: <json>\\n\\n` con el snapshot to_progress_dict().
+    Frecuencia ≈ 2 Hz (poll cada 500 ms). Termina con un evento final del estado terminal
+    o un evento 'gone' si el job desaparece (limpieza por TTL).
+    """
+    job = REGISTRY.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' no existe o expiró")
+
+    async def event_generator():
+        last_payload = ""
+        # Heartbeat inicial para que el cliente reciba algo de inmediato
+        try:
+            yield f"data: {json.dumps(job.to_progress_dict())}\n\n"
+        except Exception:
+            pass
+
+        terminal = {"done", "error", "cancelled"}
+        for _ in range(60 * 60 * 2):  # tope ~2h por si algo se cuelga: 0.5s * 14400 = 2h
+            j = REGISTRY.get(job_id)
+            if j is None:
+                yield 'event: gone\ndata: {"status": "gone"}\n\n'
+                return
+            payload = json.dumps(j.to_progress_dict())
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+            if j.status in terminal:
+                return
+            await asyncio.sleep(0.5)
+
+    headers = {
+        # Headers críticos para SSE detrás de proxies y para que el browser no buffer-ee
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
+@app.get("/api/jobs/{job_id}/result")
+def job_result(job_id: str) -> Response:
+    """
+    Devuelve el PNG final de un job completado. 404 si no existe, 409 si todavía no terminó.
+    """
+    job = REGISTRY.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' no existe o expiró")
+    if job.status == "error":
+        raise HTTPException(status_code=500, detail=job.error_message or "error desconocido")
+    if job.status == "cancelled":
+        raise HTTPException(status_code=410, detail="job cancelado por el cliente")
+    if job.status != "done" or job.image_bytes is None:
+        raise HTTPException(status_code=409, detail=f"job aún no terminó (status={job.status})")
+    return Response(content=job.image_bytes, media_type="image/png", headers=job.image_headers or {})
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def job_cancel(job_id: str) -> dict:
+    """Marca el job como 'cancel requested'. El worker abortará en el próximo checkpoint."""
+    job = REGISTRY.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"job_id '{job_id}' no existe o expiró")
+    job.request_cancel()
+    return {"job_id": job_id, "cancel_requested": True, "status": job.status}
 
 
 # ---------------------------------------------------------------------------

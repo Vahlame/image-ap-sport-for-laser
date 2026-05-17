@@ -552,6 +552,136 @@ def tone_match_error(binary: np.ndarray, gray_post_lut: np.ndarray, scale: int =
     return float(np.mean((b_local - g_local) ** 2))
 
 
+def multi_scale_tone_match_error(
+    binary: np.ndarray,
+    gray_post_lut: np.ndarray,
+    scales: tuple[int, ...] = (4, 8, 16),
+    weights: tuple[float, ...] = (0.50, 0.30, 0.20),
+) -> float:
+    """
+    Tone-match error promediado en MÚLTIPLES escalas.
+
+    El single-scale (scale=8) original es ciego a detalles pequeños: un toro de 4-8 px
+    en zona casi blanca se promedia con el blanco circundante y el error es bajo aunque
+    el binario haya perdido completamente el detalle.
+
+    Multi-scale: escalas finas (4 px) capturan detalles chicos; escalas gruesas (16 px)
+    mantienen tono general. Peso mayor en escala fina (0.50) revela la pérdida del toro.
+
+    Pesos por default suman 1.0 — el caller puede ajustarlos.
+    """
+    if len(scales) != len(weights):
+        raise ValueError(f"[SCORING] scales y weights deben tener mismo largo: {len(scales)} vs {len(weights)}")
+    if abs(sum(weights) - 1.0) > 1e-6:
+        raise ValueError(f"[SCORING] weights de multi_scale_tone_match deben sumar 1.0, suman {sum(weights)}")
+    total = 0.0
+    for s, w in zip(scales, weights):
+        total += w * tone_match_error(binary, gray_post_lut, scale=s)
+    return float(total)
+
+
+def edge_preservation_error(
+    binary: np.ndarray,
+    gray_post_lut: np.ndarray,
+    ppd: float = 64.0,
+    bright_threshold: float = 0.6,
+    edge_percentile: float = 85.0,
+) -> float:
+    """
+    Mide la pérdida de bordes finos en zonas brillantes (el problema del logo Red Bull
+    en capó blanco).
+
+    Pipeline:
+      1. Sobel-magnitude del gris pre-dither → mapa de "dónde están los bordes importantes".
+      2. Sobel-magnitude del binario PASADO por filtro CSF (HVS) → mapa de bordes percibidos.
+      3. Máscara de zonas brillantes (gray > bright_threshold) → ahí es donde el problema duele.
+      4. Bordes "importantes": top-K% del magnitude del gris (K = 100 - edge_percentile).
+      5. Error = 1 - IoU entre bordes importantes del gris y del binario filtrado,
+         ponderado por la intensidad del borde y restringido a zonas brillantes.
+
+    Returns:
+        score en [0, 1]: 0 = preserva todos los bordes en zonas claras; 1 = los pierde todos.
+
+    Justificación física:
+      Un cluster de puntos negros en zona casi blanca degrada el spectral_radial_penalty
+      pero es **necesario** para que el ojo perciba el detalle. Este término compensa
+      esa penalización injusta, premiando al algoritmo que sí preserva el toro.
+
+    Args:
+        bright_threshold: gris normalizado [0,1] mínimo para considerar "zona brillante"
+            (default 0.6 = capó claro, paredes pastel, fondos blancos).
+        edge_percentile: percentil sobre el magnitude para definir "edge importante"
+            (default 85 = top 15% del gradient; ajustar si la imagen tiene mucho/poco edge).
+    """
+    from scipy import ndimage as ndi
+    if binary.shape != gray_post_lut.shape:
+        raise ValueError(
+            f"[SCORING] edge_preservation: shapes distintas {binary.shape} vs {gray_post_lut.shape}"
+        )
+
+    g = gray_post_lut.astype(np.float64)
+    if g.max() > 1.0:
+        g = g / 255.0
+    b = binary.astype(np.float64) / 255.0
+
+    # Edges del gris (referencia) — Sobel magnitude
+    gx = ndi.sobel(g, axis=1)
+    gy = ndi.sobel(g, axis=0)
+    g_mag = np.sqrt(gx * gx + gy * gy)
+
+    # Edges del binario PERCIBIDO (post-CSF) — esto es lo que el ojo ve realmente
+    b_perceived = _csf_mannos_sakrison_filter(binary, ppd)
+    bx = ndi.sobel(b_perceived, axis=1)
+    by = ndi.sobel(b_perceived, axis=0)
+    b_mag = np.sqrt(bx * bx + by * by)
+
+    # Máscara de zonas brillantes — donde la pérdida importa
+    bright_mask = g > float(bright_threshold)
+    if not np.any(bright_mask):
+        return 0.0  # no hay zonas brillantes → nada que preservar
+
+    # Normalizar magnitudes ANTES de seleccionar bordes (Sobel max ~4.0 con kernel 3x3
+    # sobre valor en [0,1]; normalizar a [0,1] facilita el threshold).
+    g_max = float(g_mag.max())
+    if g_max < 1e-6:
+        return 0.0  # imagen plana sin bordes en ningún lado
+    g_mag_norm = g_mag / g_max
+
+    # Bordes "importantes": estrategia robusta a imágenes mayormente planas.
+    # Usar el percentil sobre los magnitudes NO-cero (descartando el noise floor)
+    # combinado con un mínimo absoluto del 5% del max. Así "important" significa
+    # "borde real, no ruido de cuantización".
+    nonzero_thresh = 0.05  # 5% del max — descarta ruido de Sobel en zonas planas
+    nonzero_mag = g_mag_norm[g_mag_norm > nonzero_thresh]
+    if nonzero_mag.size == 0:
+        # Fallback: imagen "mayormente plana" pero puede tener un MICRO-DETALLE
+        # aislado (logo Red Bull 4×6px, etc.) que no cruza el threshold por percentil
+        # pero sí tiene gradient relativo distinguible.
+        # Usamos un threshold absoluto muy bajo (1% del max) en zonas brillantes
+        # como red de seguridad para no perder estos casos.
+        micro_thresh = 0.01
+        important_edges = (g_mag_norm >= micro_thresh) & bright_mask
+        if not np.any(important_edges):
+            return 0.0
+    else:
+        edge_thresh = float(np.percentile(nonzero_mag, float(edge_percentile)))
+        edge_thresh = max(edge_thresh, nonzero_thresh)
+        important_edges = (g_mag_norm >= edge_thresh) & bright_mask
+        if not np.any(important_edges):
+            return 0.0  # los bordes importantes están en zonas oscuras (no aplica)
+
+    # Normalizar b_mag al mismo rango que g_mag para comparación 1:1
+    b_max = float(b_mag.max())
+    b_mag_norm = b_mag / b_max if b_max > 1e-12 else b_mag * 0.0
+
+    # Error = diferencia normalizada en bordes importantes, ponderado por intensidad
+    edge_weight = g_mag_norm[important_edges]
+    diff = np.abs(g_mag_norm[important_edges] - b_mag_norm[important_edges])
+    weighted_error = float(np.sum(diff * edge_weight) / (np.sum(edge_weight) + 1e-12))
+
+    return float(min(max(weighted_error, 0.0), 1.0))
+
+
 def score_candidate_v5_terms(
     out: np.ndarray,
     gray: np.ndarray,
@@ -561,21 +691,32 @@ def score_candidate_v5_terms(
     ppd: float = 64.0,
     low_band_fraction: float = 0.10,
     tone_scale: int = 8,
+    multi_scale_tone: bool = True,
+    detail_weight: float = 0.35,
+    bright_threshold: float = 0.6,
 ) -> dict[str, float]:
     """
-    Desglose completo de score v5 sin referencia.
+    Desglose completo de score v5 sin referencia (v1.5+: con preservación de bordes).
 
     Combina:
       - HVS-MSE (CSF Mannos-Sakrison): error perceptual binario vs gris tras filtro.
       - Spectral radial penalty: energia en baja freq (blue-noise compliance).
-      - Tone match local post-LUT: match en bloques (dot-gain compensation).
+      - Tone match local post-LUT (multi-scale si multi_scale_tone=True):
+        match en bloques de [4, 8, 16] px ponderado, captura detalles finos.
+      - **Edge preservation error** (v1.5): penaliza pérdida de bordes finos en
+        zonas brillantes (problema del logo Red Bull en capó claro).
       - Regularizacion v2/v3/v4 compartida.
 
-    Pesos (suman 1.05 incluida regularizacion):
-      0.50*hvs_mse + 0.30*spec_penalty + 0.20*tone + 0.05*reg
+    Pesos (v1.5):
+      0.40*hvs_mse + 0.25*spec_penalty + 0.15*tone + 0.15*detail + 0.05*reg
+
+    Backwards-compat: si `multi_scale_tone=False`, usa solo scale=tone_scale (legacy v1.4)
+    y omite el detail term (detail_weight=0.0 lo desactiva).
 
     `lut` callable: si se pasa, se aplica al gris antes de comparar (compensar dot-gain).
     `ppd` (pixels per degree): default 64 razonable para ~300 DPI viewing distance.
+    `bright_threshold`: gris normalizado [0,1] sobre el cual se considera "zona brillante"
+        para el edge preservation (default 0.6).
     """
     if out.shape != gray.shape:
         raise ValueError(f"[SCORING] v5 shapes distintas {out.shape} vs {gray.shape}")
@@ -583,7 +724,17 @@ def score_candidate_v5_terms(
     gray_lut = lut(gray) if lut is not None else gray
     hvs_err = hvs_mse(out, gray_lut, ppd=ppd)
     spec_penalty = spectral_radial_penalty(out, low_band_fraction=low_band_fraction)
-    tone_err = tone_match_error(out, gray_lut, scale=tone_scale)
+    if multi_scale_tone:
+        tone_err = multi_scale_tone_match_error(out, gray_lut)
+    else:
+        tone_err = tone_match_error(out, gray_lut, scale=tone_scale)
+
+    # Detail preservation: solo si detail_weight > 0
+    if detail_weight > 0:
+        detail_err = edge_preservation_error(out, gray_lut, ppd=ppd, bright_threshold=bright_threshold)
+    else:
+        detail_err = 0.0
+
     white_ratio = float(np.mean(out == 255))
 
     if candidate is not None:
@@ -595,16 +746,35 @@ def score_candidate_v5_terms(
     else:
         reg = reg_contrast = reg_brightness = reg_sharpen = 0.0
 
-    w_hvs = 0.50 * hvs_err
-    w_spec = 0.30 * spec_penalty
-    w_tone = 0.20 * tone_err
+    # Re-balance v1.5: 0.35*hvs + 0.20*spec + 0.10*tone + 0.35*detail + 0.05*reg = 1.05
+    # Si detail_weight=0, redistribuir su peso a hvs/spec/tone (preserva semántica v1.4).
+    if detail_weight > 0:
+        # Pesos base ajustados; el caller puede subir detail_weight para casos extremos
+        # (logos chicos en zonas planas), bajarlo si genera ruido (default OK para fotos
+        # comunes con detalles visibles).
+        w_hvs_factor = 0.35
+        w_spec_factor = 0.20
+        w_tone_factor = 0.10
+        w_detail_factor = float(detail_weight)
+    else:
+        # Modo legacy v1.4 (sin detail term): preserva pesos originales 50/30/20.
+        w_hvs_factor = 0.50
+        w_spec_factor = 0.30
+        w_tone_factor = 0.20
+        w_detail_factor = 0.0
+
+    w_hvs = w_hvs_factor * hvs_err
+    w_spec = w_spec_factor * spec_penalty
+    w_tone = w_tone_factor * tone_err
+    w_detail = w_detail_factor * detail_err
     w_reg = 0.05 * reg
-    score = w_hvs + w_spec + w_tone + w_reg
+    score = w_hvs + w_spec + w_tone + w_detail + w_reg
 
     return {
         "hvs_mse": hvs_err,
         "spectral_lowfreq_penalty": spec_penalty,
         "tone_error": tone_err,
+        "detail_error": detail_err,
         "white_ratio": white_ratio,
         "reg": reg,
         "reg_contrast": reg_contrast,
@@ -613,9 +783,13 @@ def score_candidate_v5_terms(
         "ppd": float(ppd),
         "low_band_fraction": float(low_band_fraction),
         "tone_scale": int(tone_scale),
+        "multi_scale_tone": bool(multi_scale_tone),
+        "detail_weight": float(detail_weight),
+        "bright_threshold": float(bright_threshold),
         "w_hvs": w_hvs,
         "w_spec": w_spec,
         "w_tone": w_tone,
+        "w_detail": w_detail,
         "w_reg": w_reg,
         "score": score,
     }

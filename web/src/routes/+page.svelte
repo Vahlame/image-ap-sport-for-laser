@@ -8,6 +8,7 @@
 		loadMyConfig,
 		saveMyConfig,
 		type AlgorithmGroup,
+		type JobProgress,
 		type MaterialInfo,
 		type MyConfig,
 		type ProcessMeta,
@@ -75,6 +76,14 @@
 		if (url) URL.revokeObjectURL(url);
 	}
 
+	function formatSeconds(s: number): string {
+		if (!Number.isFinite(s) || s < 0) return '–';
+		if (s < 60) return `${s.toFixed(0)}s`;
+		const m = Math.floor(s / 60);
+		const r = Math.round(s - m * 60);
+		return `${m}m ${r.toString().padStart(2, '0')}s`;
+	}
+
 	// --- Bootstrap: conectar al backend ---
 	onMount(async () => {
 		try {
@@ -116,13 +125,55 @@
 		}
 	}
 
-	/** Modo Express: subir foto → procesa con MyConfig + preset=auto + HQ → result inmediato. */
+	// --- Progreso async (SSE) ---
+	let expressJobId = $state<string | null>(null);
+	let expressProgress = $state<JobProgress | null>(null);
+	let expressCancelled = $state(false);
+	let showProgressLog = $state(false);
+
+	/** Construye el d="M..." de un sparkline SVG dado un arreglo de scores (menor=mejor). */
+	function buildSparklinePath(values: number[], width = 220, height = 36): string {
+		if (!values.length) return '';
+		const n = values.length;
+		const min = Math.min(...values);
+		const max = Math.max(...values);
+		const range = max - min || 1;
+		const dx = n > 1 ? width / (n - 1) : 0;
+		const pts = values.map((v, i) => {
+			const x = i * dx;
+			// Invertimos Y para que menor score (mejor) quede arriba
+			const y = height - ((v - min) / range) * (height - 4) - 2;
+			return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+		});
+		return pts.join(' ');
+	}
+
+	function resetExpressProgress() {
+		expressProgress = null;
+		expressJobId = null;
+		expressCancelled = false;
+	}
+
+	async function cancelExpressJob() {
+		if (!expressJobId) return;
+		expressCancelled = true;
+		try {
+			await apiClient.cancelJob(expressJobId);
+		} catch (err) {
+			console.warn('cancel job:', err);
+		}
+	}
+
+	/** Modo Express: subir foto → procesa con MyConfig + preset=auto + HQ → result inmediato.
+	 *  IMPORTANT: para que preset='auto' aplique completo, solo mandamos los campos
+	 *  que el usuario controla (material/mm/dpi/sharpen). Los demás los completa el
+	 *  backend con su default y luego el merger los reemplaza con los del preset elegido.
+	 */
 	async function expressProcess(file: File) {
 		expressError = null;
-		expressProgressMsg = 'Subiendo y analizando imagen...';
+		resetExpressProgress();
+		expressProgressMsg = 'Subiendo imagen…';
 
-		// 1. Crear cropped blob = imagen original (sin recortar manualmente)
-		// El usuario puede recortar después si lo necesita
 		const imageBlob = file;
 		revoke(croppedUrl);
 		revoke(finalBlobUrl);
@@ -134,34 +185,53 @@
 		simBlobUrl = null;
 		simMeta = null;
 
-		// 2. Componer params desde MyConfig + preset auto + HQ best
-		params = {
-			...DEFAULT_PARAMS,
+		// Params mínimos: el preset auto + las decisiones físicas del usuario.
+		// NO spread DEFAULT_PARAMS — eso enviaría algorithm/threshold/etc. con valores
+		// distintos al schema default y rompería el auto-merge del preset en el backend.
+		const expressParams: Partial<ProcessParams> = {
 			preset: 'auto',
 			material: myConfig.material,
 			output_mm_short: myConfig.output_mm_short,
 			output_dpi: myConfig.output_dpi,
 			sharpen_radius_mm: myConfig.sharpen_radius_mm,
+			score_version: myConfig.score_version ?? 'v5'
 		};
+		// Reflejar también en `params` para que el wizard manual pueda continuar
+		// si el usuario salta a modo manual desde el resultado.
+		params = { ...DEFAULT_PARAMS, ...expressParams } as ProcessParams;
 
 		try {
-			expressProgressMsg = `Procesando con HQ refinement (puede tardar 2-3 min para máxima calidad)...`;
 			processingFull = true;
-			const { blob, meta } = await apiClient.render('process', imageBlob, params);
+			expressProgressMsg = 'Procesando con HQ refinement…';
+
+			const { blob, meta } = await apiClient.renderAsync(imageBlob, expressParams, {
+				onJobStart: (id) => {
+					expressJobId = id;
+				},
+				onProgress: (p) => {
+					expressProgress = p;
+				}
+			});
+
 			revoke(finalBlobUrl);
 			finalBlob = blob;
 			finalBlobUrl = URL.createObjectURL(blob);
 			finalMeta = meta;
 			expressProgressMsg = '';
+			resetExpressProgress();
 
-			// Cargar recomendaciones LightBurn
 			await loadRecommendedSettings(myConfig.material);
-
 			await tick();
 			step = 4;
 		} catch (err) {
-			expressError = err instanceof Error ? err.message : String(err);
-			expressProgressMsg = '';
+			if (expressCancelled) {
+				expressProgressMsg = '';
+				expressError = 'Procesamiento cancelado por el usuario.';
+			} else {
+				expressError = err instanceof Error ? err.message : String(err);
+				expressProgressMsg = '';
+			}
+			resetExpressProgress();
 		} finally {
 			processingFull = false;
 		}
@@ -267,21 +337,36 @@
 		if (!croppedBlob) return;
 		processingFull = true;
 		previewError = null;
+		resetExpressProgress();
+		// Propagar la elección de métrica desde MyConfig hacia los params del Manual.
+		const paramsWithMetric = { ...params, score_version: myConfig.score_version ?? params.score_version ?? 'v5' };
 		try {
-			const { blob, meta } = await apiClient.render('process', croppedBlob, params);
+			const { blob, meta } = await apiClient.renderAsync(croppedBlob, paramsWithMetric, {
+				onJobStart: (id) => {
+					expressJobId = id;
+				},
+				onProgress: (p) => {
+					expressProgress = p;
+				}
+			});
 			revoke(finalBlobUrl);
 			finalBlob = blob;
 			finalBlobUrl = URL.createObjectURL(blob);
 			finalMeta = meta;
-			// limpiar simulación previa
 			if (simBlobUrl) URL.revokeObjectURL(simBlobUrl);
 			simBlobUrl = null;
 			simMeta = null;
 			simError = null;
+			resetExpressProgress();
 			await tick();
 			step = 4;
 		} catch (err) {
-			previewError = err instanceof Error ? err.message : String(err);
+			if (expressCancelled) {
+				previewError = 'Procesamiento cancelado por el usuario.';
+			} else {
+				previewError = err instanceof Error ? err.message : String(err);
+			}
+			resetExpressProgress();
 		} finally {
 			processingFull = false;
 		}
@@ -415,7 +500,7 @@
 					<summary>
 						<span>⚙ Mi configuración</span>
 						<code class="my-config-summary">
-							{myConfig.material || 'sin material'} · {myConfig.output_mm_short}mm @ {myConfig.output_dpi}DPI
+							{myConfig.material || 'sin material'} · {myConfig.output_mm_short}mm @ {myConfig.output_dpi}DPI · {(myConfig.score_version ?? 'v5').toUpperCase()}
 						</code>
 					</summary>
 					<p class="hint">
@@ -442,6 +527,54 @@
 						<div class="field">
 							<label for="mc-sr">Sharpen radius (mm)</label>
 							<input id="mc-sr" type="number" step="0.01" min="0.05" max="2" bind:value={myConfig.sharpen_radius_mm} onchange={persistMyConfig} />
+						</div>
+					</div>
+
+					<!-- Toggle métrica de calidad (v5 CPU / v4 GPU) -->
+					<div class="metric-toggle">
+						<div class="metric-toggle-head">
+							<span class="metric-toggle-label">Métrica de calidad (HQ refine)</span>
+							<span class="metric-toggle-badge" class:active={cudaAvailable}>
+								{cudaAvailable ? '⚡ GPU disponible' : '🖥 CPU only'}
+							</span>
+						</div>
+						<div class="metric-toggle-options">
+							<label class="metric-opt" class:selected={(myConfig.score_version ?? 'v5') === 'v5'}>
+								<input
+									type="radio"
+									name="score_version"
+									value="v5"
+									checked={(myConfig.score_version ?? 'v5') === 'v5'}
+									onchange={() => { myConfig.score_version = 'v5'; persistMyConfig(); }} />
+								<div class="metric-opt-body">
+									<strong>Estándar — v5 (CPU, no-reference)</strong>
+									<span class="metric-opt-desc">
+										HVS-MSE + spectral blue-noise + tone match post-LUT. ~5-15 ms / candidato.
+										Diseñada específicamente para grabado láser. <em>Recomendada.</em>
+									</span>
+								</div>
+							</label>
+							<label class="metric-opt" class:selected={myConfig.score_version === 'v4'}>
+								<input
+									type="radio"
+									name="score_version"
+									value="v4"
+									checked={myConfig.score_version === 'v4'}
+									onchange={() => { myConfig.score_version = 'v4'; persistMyConfig(); }} />
+								<div class="metric-opt-body">
+									<strong>Perceptual — v4 (LPIPS + AlexNet)</strong>
+									<span class="metric-opt-desc">
+										{#if cudaAvailable}
+											Comparación perceptual contra auto-target. ~50-200 ms / candidato (acelera con GPU).
+											Útil para A/B contra v5 si querés contrastar resultados.
+										{:else}
+											<span class="warn-inline">⚠ Tu PyTorch es <code>+cpu</code> — v4 correrá en CPU (lento ~5-10×).</span>
+											Para acelerar reinstalá con:
+											<code class="snippet">pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121</code>
+										{/if}
+									</span>
+								</div>
+							</label>
 						</div>
 					</div>
 				</details>
@@ -471,8 +604,115 @@
 							{/if}
 						</span>
 					</label>
-					{#if expressProgressMsg}
-						<p class="preset-progress">⏳ {expressProgressMsg}</p>
+					{#if processingFull || expressProgressMsg}
+						<div class="progress-card">
+							<div class="progress-head">
+								<span class="progress-msg">
+									⏳ {expressProgressMsg || (expressProgress?.stage === 'refine'
+										? `Buscando mejor candidato HQ (${expressProgress.current}/${expressProgress.total})`
+										: expressProgress?.stage
+											? `Etapa: ${expressProgress.stage}`
+											: 'Procesando…')}
+								</span>
+								<button type="button" class="btn btn-ghost btn-cancel" onclick={cancelExpressJob} disabled={expressCancelled}>
+									{expressCancelled ? 'Cancelando…' : 'Cancelar'}
+								</button>
+							</div>
+							{#if expressProgress}
+								<div class="progress-bar" role="progressbar" aria-valuenow={expressProgress.progress_pct} aria-valuemin="0" aria-valuemax="100">
+									<div class="progress-fill" style:width={`${Math.min(100, Math.max(0, expressProgress.progress_pct))}%`}></div>
+								</div>
+								<div class="progress-stats">
+									<span><strong>{expressProgress.progress_pct.toFixed(0)}%</strong></span>
+									<span>•</span>
+									<span>{expressProgress.current}/{expressProgress.total}</span>
+									<span>•</span>
+									<span>transcurrido {formatSeconds(expressProgress.elapsed_seconds)}</span>
+									{#if expressProgress.eta_seconds !== null && expressProgress.eta_seconds > 0}
+										<span>•</span>
+										<span>ETA {formatSeconds(expressProgress.eta_seconds)}</span>
+									{/if}
+								</div>
+
+								<!-- Telemetría extendida -->
+								<div class="telemetry-grid">
+									{#if expressProgress.best_score !== null}
+										<div class="tm-cell">
+											<span class="tm-label">Mejor score (menor=mejor)</span>
+											<span class="tm-val">{expressProgress.best_score.toFixed(4)}</span>
+										</div>
+									{/if}
+									{#if expressProgress.seconds_per_candidate !== null}
+										<div class="tm-cell">
+											<span class="tm-label">Avg / candidato</span>
+											<span class="tm-val">{expressProgress.seconds_per_candidate.toFixed(2)}s</span>
+										</div>
+									{/if}
+									{#if expressProgress.last_candidate_seconds !== null}
+										<div class="tm-cell">
+											<span class="tm-label">Último candidato</span>
+											<span class="tm-val">{expressProgress.last_candidate_seconds.toFixed(2)}s</span>
+										</div>
+									{/if}
+									{#if expressProgress.memory_mb !== null}
+										<div class="tm-cell">
+											<span class="tm-label">RAM (RSS)</span>
+											<span class="tm-val">{expressProgress.memory_mb.toFixed(0)} MB</span>
+										</div>
+									{/if}
+									{#if expressProgress.cpu_pct !== null && expressProgress.cpu_pct > 0}
+										<div class="tm-cell">
+											<span class="tm-label">CPU</span>
+											<span class="tm-val">{expressProgress.cpu_pct.toFixed(0)}%</span>
+										</div>
+									{/if}
+									<div class="tm-cell">
+										<span class="tm-label">Etapa</span>
+										<span class="tm-val">{expressProgress.stage || '—'}</span>
+									</div>
+								</div>
+
+								<!-- Sparkline evolución del best score -->
+								{#if expressProgress.score_history.length > 1}
+									<div class="sparkline-wrap">
+										<div class="sparkline-head">
+											<span class="tm-label">Evolución del mejor score</span>
+											<span class="sparkline-range">
+												{Math.min(...expressProgress.score_history).toFixed(4)}
+												→
+												{Math.max(...expressProgress.score_history).toFixed(4)}
+											</span>
+										</div>
+										<svg class="sparkline" viewBox="0 0 220 36" preserveAspectRatio="none">
+											<path
+												d={buildSparklinePath(expressProgress.score_history)}
+												fill="none"
+												stroke="var(--accent)"
+												stroke-width="1.8"
+												stroke-linejoin="round"
+												stroke-linecap="round" />
+										</svg>
+									</div>
+								{/if}
+
+								<!-- Log scrollable -->
+								<details class="log-details" bind:open={showProgressLog}>
+									<summary>
+										Log del worker ({expressProgress.log_lines.length})
+									</summary>
+									<div class="log-scroll">
+										{#each expressProgress.log_lines.slice().reverse() as ln, i (i)}
+											<div class="log-line log-{ln.kind}">
+												<span class="log-t">{ln.t.toFixed(2)}s</span>
+												<span class="log-msg">{ln.msg}</span>
+											</div>
+										{/each}
+									</div>
+								</details>
+							{:else}
+								<div class="progress-bar"><div class="progress-fill indeterminate"></div></div>
+							{/if}
+						</div>
 					{/if}
 					{#if expressError}
 						<p class="warn">⚠ {expressError}</p>
@@ -573,10 +813,21 @@
 								<option value="none">Ninguno</option>
 								<option value="sauvola">Sauvola (contraste local)</option>
 								<option value="niblack">Niblack (umbral local)</option>
+								<option value="clahe">CLAHE (revela detalles en zonas claras)</option>
+								<option value="sauvola_clahe">CLAHE + Sauvola (combo agresivo)</option>
 							</select>
+							{#if params.preprocess_mode === 'clahe' || params.preprocess_mode === 'sauvola_clahe'}
+								<p class="hint">
+									CLAHE redistribuye contraste local: ideal cuando hay detalles (logos, letras chicas)
+									en zonas casi blancas o casi negras que el dither pierde.
+								</p>
+							{/if}
 						</div>
 						<div class="field-row">
 							<label class="check"><input type="checkbox" bind:checked={params.invert} /> Invertir</label>
+							<label class="check" title="Convierte zonas localmente uniformes (cielo, fondos planos) a blanco/negro puro antes del dither. Reduce ruido moteado y pulsos del láser.">
+								<input type="checkbox" bind:checked={params.simplify_plain_regions} /> Simplificar fondos planos
+							</label>
 						</div>
 						<div class="slider">
 							<label for="thr">Umbral <code>{params.threshold}</code></label>
@@ -604,6 +855,56 @@
 						</div>
 					</details>
 
+					{#if processingFull}
+						<div class="progress-card progress-card-compact">
+							<div class="progress-head">
+								<span class="progress-msg">
+									⏳ {expressProgress?.stage === 'refine'
+										? `HQ (${expressProgress.current}/${expressProgress.total})`
+										: expressProgress?.stage
+											? `Etapa: ${expressProgress.stage}`
+											: 'Procesando…'}
+								</span>
+								<button type="button" class="btn btn-ghost btn-cancel" onclick={cancelExpressJob} disabled={expressCancelled}>
+									{expressCancelled ? 'Cancelando…' : 'Cancelar'}
+								</button>
+							</div>
+							{#if expressProgress}
+								<div class="progress-bar" role="progressbar" aria-valuenow={expressProgress.progress_pct} aria-valuemin="0" aria-valuemax="100">
+									<div class="progress-fill" style:width={`${Math.min(100, Math.max(0, expressProgress.progress_pct))}%`}></div>
+								</div>
+								<div class="progress-stats">
+									<span><strong>{expressProgress.progress_pct.toFixed(0)}%</strong></span>
+									<span>• {formatSeconds(expressProgress.elapsed_seconds)}</span>
+									{#if expressProgress.eta_seconds !== null && expressProgress.eta_seconds > 0}
+										<span>• ETA {formatSeconds(expressProgress.eta_seconds)}</span>
+									{/if}
+									{#if expressProgress.memory_mb !== null}
+										<span>• {expressProgress.memory_mb.toFixed(0)} MB</span>
+									{/if}
+									{#if expressProgress.cpu_pct !== null && expressProgress.cpu_pct > 0}
+										<span>• CPU {expressProgress.cpu_pct.toFixed(0)}%</span>
+									{/if}
+									{#if expressProgress.best_score !== null}
+										<span>• score <code>{expressProgress.best_score.toFixed(4)}</code></span>
+									{/if}
+								</div>
+								{#if expressProgress.score_history.length > 2}
+									<svg class="sparkline sparkline-compact" viewBox="0 0 220 24" preserveAspectRatio="none">
+										<path
+											d={buildSparklinePath(expressProgress.score_history, 220, 24)}
+											fill="none"
+											stroke="var(--accent)"
+											stroke-width="1.6"
+											stroke-linejoin="round"
+											stroke-linecap="round" />
+									</svg>
+								{/if}
+							{:else}
+								<div class="progress-bar"><div class="progress-fill indeterminate"></div></div>
+							{/if}
+						</div>
+					{/if}
 					<div class="actions">
 						<button type="button" class="btn btn-secondary" onclick={() => (step = 2)}>← Recorte</button>
 						<button type="button" class="btn btn-primary" disabled={processingFull || !backendOnline} onclick={processFullRes}>
@@ -1287,15 +1588,273 @@
 		box-shadow: 0 0 14px var(--accent-glow);
 	}
 
-	.preset-progress {
+	/* Toggle de métrica (v5 CPU / v4 GPU) en Mi configuración */
+	.metric-toggle {
+		margin-top: 0.8rem;
+		padding-top: 0.8rem;
+		border-top: 1px dashed var(--border);
+	}
+	.metric-toggle-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.5rem;
+	}
+	.metric-toggle-label {
+		font-size: 0.85rem;
+		color: var(--text);
+		font-weight: 600;
+	}
+	.metric-toggle-badge {
+		font-size: 0.72rem;
+		padding: 0.18rem 0.55rem;
+		border-radius: 99px;
+		background: rgba(170, 170, 170, 0.12);
+		color: var(--text-muted);
+		border: 1px solid var(--border);
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+	}
+	.metric-toggle-badge.active {
+		background: rgba(142, 224, 107, 0.18);
+		color: var(--accent);
+		border-color: var(--border-strong);
+	}
+	.metric-toggle-options {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+	.metric-opt {
+		display: flex;
+		gap: 0.55rem;
+		padding: 0.6rem 0.8rem;
+		border: 1px solid var(--border);
+		border-radius: 8px;
+		background: rgba(0, 0, 0, 0.18);
+		cursor: pointer;
+		transition: all 0.15s;
+	}
+	.metric-opt:hover { border-color: var(--border-strong); }
+	.metric-opt.selected {
+		border-color: var(--accent);
+		background: rgba(142, 224, 107, 0.06);
+		box-shadow: 0 0 0 1px var(--accent-glow);
+	}
+	.metric-opt input[type='radio'] {
+		margin-top: 0.25rem;
+		accent-color: var(--accent);
+	}
+	.metric-opt-body {
+		display: flex;
+		flex-direction: column;
+		gap: 0.18rem;
+		flex: 1;
+	}
+	.metric-opt-body strong { font-size: 0.88rem; color: var(--text); }
+	.metric-opt-desc {
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		line-height: 1.4;
+	}
+	.metric-opt-desc em { color: var(--accent); font-style: normal; }
+	.warn-inline { color: var(--warn); }
+	.metric-opt-desc code, .snippet {
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+		font-size: 0.72rem;
+		background: rgba(0, 0, 0, 0.35);
+		padding: 0.05rem 0.35rem;
+		border-radius: 4px;
+		color: var(--accent);
+	}
+	.snippet {
+		display: block;
+		margin-top: 0.3rem;
+		padding: 0.35rem 0.5rem;
+		overflow-x: auto;
+		white-space: nowrap;
+	}
+
+	/* Progress card (Express + Manual) */
+	.progress-card {
 		margin-top: 1rem;
-		padding: 0.7rem 1rem;
-		background: rgba(142, 224, 107, 0.10);
-		border-left: 3px solid var(--accent);
-		border-radius: 6px;
+		padding: 0.9rem 1rem;
+		background: rgba(142, 224, 107, 0.06);
+		border: 1px solid var(--border-strong);
+		border-radius: 10px;
+	}
+	.progress-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 0.6rem;
+	}
+	.progress-msg {
 		color: var(--text);
 		font-size: 0.9rem;
+		font-weight: 500;
 	}
+	.btn-cancel {
+		padding: 0.35rem 0.75rem;
+		font-size: 0.78rem;
+	}
+	.progress-bar {
+		height: 8px;
+		width: 100%;
+		background: rgba(0, 0, 0, 0.35);
+		border-radius: 99px;
+		overflow: hidden;
+		position: relative;
+	}
+	.progress-fill {
+		height: 100%;
+		background: linear-gradient(90deg, var(--accent-dark), var(--accent));
+		border-radius: 99px;
+		transition: width 0.25s ease;
+		box-shadow: 0 0 8px var(--accent-glow);
+	}
+	.progress-fill.indeterminate {
+		width: 30% !important;
+		animation: indet 1.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+	}
+	@keyframes indet {
+		0% { transform: translateX(-100%); }
+		50% { transform: translateX(120%); }
+		100% { transform: translateX(420%); }
+	}
+	.progress-stats {
+		display: flex;
+		gap: 0.4rem;
+		margin-top: 0.45rem;
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+		flex-wrap: wrap;
+	}
+	.progress-stats code {
+		color: var(--accent);
+		background: rgba(0, 0, 0, 0.3);
+		padding: 0.05rem 0.4rem;
+		border-radius: 4px;
+	}
+	.progress-stats strong {
+		color: var(--text);
+	}
+
+	.progress-card-compact { padding: 0.65rem 0.85rem; }
+
+	/* Telemetría grid + cells */
+	.telemetry-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+		gap: 0.45rem;
+		margin-top: 0.7rem;
+	}
+	.tm-cell {
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		padding: 0.4rem 0.55rem;
+		background: rgba(0, 0, 0, 0.28);
+		border-radius: 6px;
+		border: 1px solid var(--border);
+	}
+	.tm-label {
+		font-size: 0.7rem;
+		color: var(--text-muted);
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+	.tm-val {
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+		font-size: 0.88rem;
+		color: var(--accent);
+		font-weight: 600;
+	}
+
+	/* Sparkline */
+	.sparkline-wrap {
+		margin-top: 0.8rem;
+		padding: 0.55rem 0.65rem;
+		background: rgba(0, 0, 0, 0.28);
+		border-radius: 6px;
+		border: 1px solid var(--border);
+	}
+	.sparkline-head {
+		display: flex;
+		justify-content: space-between;
+		align-items: baseline;
+		gap: 0.5rem;
+		margin-bottom: 0.3rem;
+	}
+	.sparkline-range {
+		font-size: 0.72rem;
+		color: var(--text-faint);
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+	}
+	.sparkline {
+		display: block;
+		width: 100%;
+		height: 36px;
+	}
+	.sparkline-compact { height: 24px; margin-top: 0.45rem; opacity: 0.85; }
+
+	/* Log scrollable */
+	.log-details {
+		margin-top: 0.7rem;
+		border: 1px solid var(--border);
+		border-radius: 6px;
+		padding: 0.4rem 0.6rem;
+		background: rgba(0, 0, 0, 0.28);
+	}
+	.log-details summary {
+		cursor: pointer;
+		font-size: 0.78rem;
+		color: var(--text-muted);
+		padding: 0.2rem 0;
+		font-weight: 500;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+	}
+	.log-details[open] summary { color: var(--accent); }
+	.log-scroll {
+		margin-top: 0.4rem;
+		max-height: 200px;
+		overflow-y: auto;
+		font-family: 'JetBrains Mono', 'Consolas', monospace;
+		font-size: 0.76rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.15rem;
+		padding-right: 0.2rem;
+	}
+	.log-line {
+		display: flex;
+		gap: 0.6rem;
+		padding: 0.18rem 0.35rem;
+		border-radius: 3px;
+		color: var(--text);
+	}
+	.log-line:hover { background: rgba(255, 255, 255, 0.03); }
+	.log-t {
+		color: var(--text-faint);
+		flex-shrink: 0;
+		min-width: 3.5rem;
+		text-align: right;
+	}
+	.log-msg {
+		flex: 1;
+		word-break: break-word;
+	}
+	.log-warn .log-msg { color: var(--warn); }
+	.log-error .log-msg { color: var(--err); }
+
+	/* Scrollbar styling for log */
+	.log-scroll::-webkit-scrollbar { width: 6px; }
+	.log-scroll::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); border-radius: 3px; }
+	.log-scroll::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+	.log-scroll::-webkit-scrollbar-thumb:hover { background: var(--accent); }
 
 	/* LightBurn recommendations card */
 	.lightburn-card {
