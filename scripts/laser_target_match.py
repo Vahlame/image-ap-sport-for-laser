@@ -638,10 +638,13 @@ def resize_to_target(input_image: Image.Image, target_size: tuple[int, int], max
 def preprocess_gray(base_gray: np.ndarray, candidate: Candidate) -> np.ndarray:
     gray = base_gray.copy()
     if candidate.autocontrast > 0:
-        low = np.percentile(gray, candidate.autocontrast)
-        high = np.percentile(gray, 100.0 - candidate.autocontrast)
-        if high > low:
-            gray = (gray - low) * (255.0 / (high - low))
+        # v2.1: protección contra imagen uniforme. Si high - low ~= 0, no estirar
+        # (evita división por casi-cero que produce np.inf y crashea downstream).
+        low = float(np.percentile(gray, candidate.autocontrast))
+        high = float(np.percentile(gray, 100.0 - candidate.autocontrast))
+        spread = high - low
+        if spread > 1.0:  # umbral: necesitamos al menos 1 unidad de spread para estirar
+            gray = (gray - low) * (255.0 / spread)
     gray = np.clip(gray, 0.0, 255.0)
     if candidate.gamma != 1.0:
         gray = 255.0 * np.power(gray / 255.0, 1.0 / candidate.gamma)

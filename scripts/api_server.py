@@ -181,10 +181,30 @@ class AlgorithmGroup(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB max upload — protección contra DoS/OOM
+
+
 def _load_image_from_bytes(data: bytes) -> Image.Image:
-    """Decodifica bytes a PIL Image RGB (raise HTTPException si invalido)."""
+    """Decodifica bytes a PIL Image RGB (raise HTTPException si invalido).
+
+    v2.1 — Validaciones:
+    - Tamaño bytes <= MAX_UPLOAD_BYTES (100MB) → 413 Payload Too Large.
+    - Dimensiones 16x16 .. 8000x8000.
+    - PIL.Image.open con context manager (cierra recursos en error path).
+    """
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"imagen demasiado grande ({len(data)//(1024*1024)} MB) — máximo {MAX_UPLOAD_BYTES//(1024*1024)} MB",
+        )
+    if len(data) < 64:
+        raise HTTPException(
+            status_code=400, detail=f"imagen invalida — vacía o corrupta ({len(data)} bytes)"
+        )
     try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
+        # Context manager para que PIL cierre recursos si convert() falla
+        with Image.open(io.BytesIO(data)) as raw:
+            img = raw.convert("RGB")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"imagen invalida: {exc}") from exc
     if img.size[0] < 16 or img.size[1] < 16:
@@ -415,9 +435,13 @@ def _hq_refine(
         if progress_cb is not None:
             try:
                 progress_cb(i, total, float(best_score), time.perf_counter() - t0)
-            except Exception:
-                # Errors in progress callback should not abort processing
-                pass
+            except Exception as cb_exc:
+                # Errores en progress_cb NO deben abortar el procesamiento,
+                # pero sí queremos visibilidad (no silent swallow). Log + continúa.
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "progress_cb raised at candidate %d/%d: %s", i, total, cb_exc
+                )
     elapsed = time.perf_counter() - t0
 
     assert best_out is not None and best_cand is not None
@@ -865,20 +889,26 @@ async def simulate(
 
 # Singleton psutil.Process del worker (necesario para que cpu_percent() mantenga su
 # baseline interno entre llamadas; un Process nuevo cada call devuelve 0.0).
+# v2.1: thread-safe con lock para evitar corrupción si 2 workers concurrentes leen
+# /escriben el estado interno de psutil simultáneamente (race documented por audit).
+import threading as _threading
+
 _PSUTIL_PROC: Any = None
+_PSUTIL_LOCK = _threading.Lock()
 
 
 def _init_process_metrics() -> None:
     """Inicializa el objeto psutil.Process global y dispara el baseline de cpu_percent."""
     global _PSUTIL_PROC
-    try:
-        import psutil
-        if _PSUTIL_PROC is None:
-            _PSUTIL_PROC = psutil.Process()
-        # Primer call siempre devuelve 0; el siguiente medirá el % real
-        _PSUTIL_PROC.cpu_percent(interval=None)
-    except Exception:
-        _PSUTIL_PROC = None
+    with _PSUTIL_LOCK:
+        try:
+            import psutil
+            if _PSUTIL_PROC is None:
+                _PSUTIL_PROC = psutil.Process()
+            # Primer call siempre devuelve 0; el siguiente medirá el % real
+            _PSUTIL_PROC.cpu_percent(interval=None)
+        except Exception:
+            _PSUTIL_PROC = None
 
 
 def _process_metrics() -> tuple[float | None, float | None]:
@@ -888,16 +918,19 @@ def _process_metrics() -> tuple[float | None, float | None]:
     Si psutil no está instalado, devuelve (None, None) sin romper.
     El cpu_pct es no-bloqueante (cached desde el último call al mismo objeto Process);
     `_init_process_metrics()` debe llamarse antes para crear el singleton.
+
+    Thread-safe: protegido con _PSUTIL_LOCK contra acceso concurrente.
     """
-    p = _PSUTIL_PROC
-    if p is None:
-        return None, None
-    try:
-        mem_mb = p.memory_info().rss / (1024 * 1024)
-        cpu = p.cpu_percent(interval=None)
-        return float(mem_mb), float(cpu)
-    except Exception:
-        return None, None
+    with _PSUTIL_LOCK:
+        p = _PSUTIL_PROC
+        if p is None:
+            return None, None
+        try:
+            mem_mb = p.memory_info().rss / (1024 * 1024)
+            cpu = p.cpu_percent(interval=None)
+            return float(mem_mb), float(cpu)
+        except Exception:
+            return None, None
 
 
 def _run_job_in_thread(job_id: str, image_bytes: bytes, params: ProcessParams) -> None:

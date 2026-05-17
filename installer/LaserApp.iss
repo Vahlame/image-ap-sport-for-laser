@@ -18,7 +18,7 @@
 ;   - 5 GB de espacio libre (mayoria es PyTorch + cuda libs).
 
 #define MyAppName "Image AP Sport for Laser"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.1.0"
 #define MyAppPublisher "Vahlame y colaboradores GPL-3.0"
 #define MyAppURL "https://github.com/Vahlame/image-ap-sport-for-laser"
 #define MyAppExeName "Iniciar_Laser_App.bat"

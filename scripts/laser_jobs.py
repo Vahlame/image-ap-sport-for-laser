@@ -54,7 +54,16 @@ class JobState:
     _cancel_requested: bool = False
 
     def to_progress_dict(self) -> dict:
-        """Snapshot serializable a JSON para SSE (sin bytes binarios)."""
+        """Snapshot serializable a JSON para SSE (sin bytes binarios).
+
+        v2.1 — Thread-safe snapshot: copia las listas mutables (score_history,
+        log_lines) ANTES de iterar para evitar race con push_score()/log() en el
+        worker. CPython GIL no garantiza atomicidad de list slicing vs append.
+        """
+        # Snapshot atómico de listas mutables (slicing en CPython es atómico para
+        # listas de inmutables como floats/dicts pero copy() es más explícito)
+        history_snapshot = list(self.score_history[-MAX_SCORE_HISTORY:])
+        log_snapshot = list(self.log_lines[-MAX_LOG_LINES:])
         return {
             "job_id": self.job_id,
             "status": self.status,
@@ -74,8 +83,8 @@ class JobState:
             "last_candidate_seconds": (
                 round(self.last_candidate_seconds, 2) if self.last_candidate_seconds is not None else None
             ),
-            "score_history": [round(float(s), 4) for s in self.score_history[-MAX_SCORE_HISTORY:]],
-            "log_lines": list(self.log_lines[-MAX_LOG_LINES:]),
+            "score_history": [round(float(s), 4) for s in history_snapshot],
+            "log_lines": log_snapshot,
         }
 
     def request_cancel(self) -> None:

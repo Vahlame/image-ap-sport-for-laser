@@ -105,8 +105,11 @@ export function saveMyConfig(c: MyConfig): void {
 	if (typeof localStorage === 'undefined') return;
 	try {
 		localStorage.setItem(MY_CONFIG_KEY, JSON.stringify(c));
-	} catch {
-		/* quota or disabled — silenciar */
+	} catch (err) {
+		// v2.1: log warning (era silent). Usuario al menos sabe via devtools que
+		// sus settings no se persistieron (típicamente: localStorage deshabilitado
+		// en modo privado, o quota excedida).
+		console.warn('[saveMyConfig] localStorage write failed (private mode / quota?)', err);
 	}
 }
 
@@ -486,8 +489,17 @@ export const apiClient = {
 					reject(new ApiError(410, 'El job expiró antes de completarse'));
 				});
 				evtSource.onerror = () => {
-					// Si ya tenemos terminal, el cleanup ya cerró todo. Si no,
-					// dejamos que el polling termine de manejar.
+					// v2.1 fix: si SSE muere abruptamente (proxy, network), cerrar
+					// el EventSource para evitar reconexiones automáticas del browser
+					// que generan requests fantasma. El polling de respaldo termina
+					// de manejar el estado terminal.
+					if (settled) return;
+					if (evtSource) {
+						try { evtSource.close(); } catch { /* ignore */ }
+						evtSource = null;
+					}
+					// NO settleamos: el polling sigue. Si el polling también falla,
+					// terminará rechazando con 404/410.
 				};
 			} catch {
 				/* sin SSE — polling se hace cargo */

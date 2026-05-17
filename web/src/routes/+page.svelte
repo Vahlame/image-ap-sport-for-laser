@@ -169,7 +169,7 @@
 	 *  que el usuario controla (material/mm/dpi/sharpen). Los demás los completa el
 	 *  backend con su default y luego el merger los reemplaza con los del preset elegido.
 	 */
-	async function expressProcess(file: File) {
+	async function expressProcess(file: File | Blob) {
 		expressError = null;
 		resetExpressProgress();
 		expressProgressMsg = 'Subiendo imagen…';
@@ -240,15 +240,22 @@
 	function onExpressDropzoneChange(e: Event) {
 		const input = e.currentTarget as HTMLInputElement;
 		const f = input.files?.[0];
+		// v2.1: reset input.value PRIMERO (no al final). Esto permite re-subir
+		// la MISMA imagen después de un error o cancelación (HTML spec: si value
+		// no cambia, no se dispara onchange, así que hay que limpiarlo antes).
+		input.value = '';
 		if (!f) return;
 		if (!/^image\//.test(f.type)) {
 			expressError = 'Formato no soportado. Usa PNG, JPG o WebP.';
-			input.value = '';
+			return;
+		}
+		// Validación temprana de tamaño (frontend) para feedback rápido
+		if (f.size > 100 * 1024 * 1024) {
+			expressError = `Imagen muy grande (${Math.round(f.size / 1024 / 1024)} MB). Máximo: 100 MB.`;
 			return;
 		}
 		revoke(originalUrl);
 		originalUrl = URL.createObjectURL(f);
-		input.value = '';
 		void expressProcess(f);
 	}
 
@@ -264,10 +271,15 @@
 	function onDropzoneChange(e: Event) {
 		const input = e.currentTarget as HTMLInputElement;
 		const f = input.files?.[0];
+		// v2.1: reset input.value PRIMERO para permitir re-subir misma imagen
+		input.value = '';
 		if (!f) return;
 		if (!/^image\//.test(f.type)) {
 			alert('Formato no soportado. Usa PNG, JPG o WebP.');
-			input.value = '';
+			return;
+		}
+		if (f.size > 100 * 1024 * 1024) {
+			alert(`Imagen muy grande (${Math.round(f.size / 1024 / 1024)} MB). Máximo: 100 MB.`);
 			return;
 		}
 		revoke(originalUrl);
@@ -283,7 +295,6 @@
 		finalMeta = null;
 		originalUrl = URL.createObjectURL(f);
 		step = 2;
-		input.value = '';
 	}
 
 	function onCropped(blob: Blob) {
@@ -393,28 +404,66 @@
 	}
 
 	function downloadFinal() {
-		if (!finalBlobUrl) return;
-		const matLabel = params.material || 'generic';
-		const dimsLabel = params.output_mm_short > 0 ? `_${params.output_mm_short}mm_${params.output_dpi}dpi` : '';
+		// Bug fix v2.1: hay que (a) usar el finalBlob directo, no finalBlobUrl
+		// (que puede estar siendo usado por <img> ya), (b) appendChild al DOM antes del
+		// click (Firefox/Safari bloquean clicks en elementos no-DOM), (c) revoke después
+		// para liberar memoria.
+		if (!finalBlob) {
+			console.warn('[downloadFinal] finalBlob es null/undefined');
+			return;
+		}
+		const matLabel = (params.material || 'generic').replace(/[^a-z0-9_-]/gi, '_');
+		const algoLabel = (params.algorithm || 'auto').replace(/[^a-z0-9_-]/gi, '_');
+		const dimsLabel =
+			params.output_mm_short > 0 ? `_${params.output_mm_short}mm_${params.output_dpi}dpi` : '';
+		const filename = `laser_ready_${matLabel}_${algoLabel}${dimsLabel}.png`;
+
+		const url = URL.createObjectURL(finalBlob);
 		const a = document.createElement('a');
-		a.href = finalBlobUrl;
-		a.download = `laser_ready_${matLabel}_${params.algorithm}${dimsLabel}.png`;
-		a.click();
+		a.href = url;
+		a.download = filename;
+		a.style.display = 'none';
+		a.rel = 'noopener';
+		document.body.appendChild(a);
+		try {
+			a.click();
+		} finally {
+			// setTimeout para que el browser termine de procesar el click antes de cleanup
+			setTimeout(() => {
+				if (a.parentNode) a.parentNode.removeChild(a);
+				URL.revokeObjectURL(url);
+			}, 100);
+		}
 	}
 
 	function backToUpload() {
+		// v2.1 fix: reset COMPLETO. Antes podía dejar processingFull=true si había
+		// race con un error async, bloqueando futuros uploads. También cancela job
+		// pendiente si hay uno.
+		if (processingFull && expressJobId) {
+			void cancelExpressJob();  // best-effort cancel
+		}
 		revoke(originalUrl);
 		revoke(croppedUrl);
 		revoke(previewBlobUrl);
 		revoke(finalBlobUrl);
+		revoke(simBlobUrl);
 		originalUrl = null;
 		croppedBlob = null;
 		croppedUrl = null;
 		previewBlobUrl = null;
 		previewMeta = null;
+		previewError = null;
 		finalBlob = null;
 		finalBlobUrl = null;
 		finalMeta = null;
+		simBlobUrl = null;
+		simMeta = null;
+		simError = null;
+		processingFull = false;
+		expressProgressMsg = '';
+		expressError = null;
+		resetExpressProgress();
 		step = 1;
 	}
 
@@ -715,7 +764,20 @@
 						</div>
 					{/if}
 					{#if expressError}
-						<p class="warn">⚠ {expressError}</p>
+						<div class="error-card">
+							<p class="warn">⚠ {expressError}</p>
+							<div class="actions">
+								<!-- v2.1: botón retry para reintentar sin tener que volver a subir -->
+								{#if croppedBlob}
+									<button type="button" class="btn btn-secondary" onclick={() => { expressError = null; void expressProcess(croppedBlob!); }}>
+										🔄 Reintentar con la misma imagen
+									</button>
+								{/if}
+								<button type="button" class="btn btn-ghost" onclick={() => { expressError = null; }}>
+									Cerrar mensaje
+								</button>
+							</div>
+						</div>
 					{/if}
 				{:else}
 					<h2 class="title">Modo Manual</h2>
@@ -1025,7 +1087,13 @@
 				{/if}
 				<div class="actions">
 					<button type="button" class="btn btn-secondary" onclick={() => (step = 3)}>← Ajustar</button>
-					<button type="button" class="btn btn-primary" onclick={() => { step = 5; }}>Descargar PNG →</button>
+					<!-- v2.1: 2 botones — descarga directa rápida + step 5 para checklist completo -->
+					<button type="button" class="btn btn-primary" onclick={downloadFinal} title="Descarga directa sin pasar por step 5">
+						⬇ Descargar PNG ahora
+					</button>
+					<button type="button" class="btn btn-secondary" onclick={() => { step = 5; }}>
+						Ver checklist →
+					</button>
 				</div>
 			</div>
 		{:else if step === 5 && finalBlobUrl}
@@ -1188,6 +1256,17 @@
 	.lede { color: var(--text-muted); margin: 0 0 1.4rem; }
 	.hint { color: var(--text-faint); font-size: 0.82rem; margin: 0.4rem 0 0; }
 	.warn { color: var(--warn); background: rgba(240, 198, 74, 0.06); border-left: 3px solid var(--warn); padding: 0.5rem 0.7rem; border-radius: 4px; font-size: 0.85rem; margin: 0.5rem 0; }
+
+	/* v2.1: tarjeta de error con botón retry */
+	.error-card {
+		margin-top: 0.8rem;
+		padding: 0.9rem 1rem;
+		background: rgba(240, 122, 110, 0.08);
+		border: 1px solid rgba(240, 122, 110, 0.3);
+		border-radius: 8px;
+	}
+	.error-card .warn { margin: 0 0 0.7rem; }
+	.error-card .actions { margin-top: 0.5rem; }
 
 	.dropzone {
 		display: flex;

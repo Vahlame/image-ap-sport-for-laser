@@ -4,6 +4,115 @@ Todas las versiones notables del proyecto se documentan acá.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/) +
 [Semver](https://semver.org/).
 
+## [2.1.0] — 2026-05-16
+
+### Bug fix urgente — Descargar imagen no funcionaba
+
+**Reportado por usuario**: al hacer clic en "Descargar" en step 5, el archivo no se
+descargaba en Firefox/Safari (Chrome funcionaba intermitente).
+
+**Causa raíz**: `downloadFinal()` creaba un `<a>` element y llamaba `.click()` SIN
+agregarlo al DOM. Firefox y Safari (especialmente con políticas strict) bloquean
+clicks programáticos en elementos no-DOM. Además, reutilizaba `finalBlobUrl` que
+podía estar siendo usado por `<img src>` simultáneamente.
+
+**Fix**:
+- Crear un `URL.createObjectURL(finalBlob)` NUEVO sólo para la descarga (no compartir
+  con `<img>`).
+- `appendChild` al `document.body` ANTES del click.
+- `setTimeout(revoke, 100)` para liberar memoria tras la descarga.
+- Sanitización del filename (regex `/[^a-z0-9_-]/gi` para chars válidos).
+- Log warning si `finalBlob` es null (debugging help).
+
+### Auditoría exhaustiva de bugs — 15 issues encontrados y arreglados
+
+Corrida automática con agente Explore que revisó frontend + backend + tests en busca de:
+race conditions, memory leaks, null guards faltantes, edge cases sin manejar, threading.
+
+#### Backend (`scripts/api_server.py`)
+
+**Bug ALTA — División por cero en autocontrast** (`laser_target_match.py:641-644`):
+- Imagen uniforme (todo gris=128) hacía `high - low = 0` → división por cero → NaN.
+- Fix: si `spread <= 1.0`, no estirar (preserva imagen original).
+- Test nuevo: `test_uniform_image_no_division_by_zero`.
+
+**Bug MEDIA — Image.open sin context manager** (`api_server.py:_load_image_from_bytes`):
+- Si `convert("RGB")` fallaba, el FD del JPEG quedaba abierto hasta GC.
+- Fix: `with Image.open(...) as raw: img = raw.convert("RGB")`.
+
+**Bug MEDIA — Sin límite de tamaño de upload** (`api_server.py`):
+- Usuario malicioso (o accidental) podía subir 5GB → OOM del servidor.
+- Fix: `MAX_UPLOAD_BYTES = 100 * 1024 * 1024` (100MB) con 413 Payload Too Large.
+- También: rechazar bytes < 64 (claramente no es imagen) con 400.
+- Tests: `test_max_upload_size_returns_413`, `test_tiny_upload_returns_400`.
+
+**Bug MEDIA — Exception silenciosa en progress_cb** (`api_server.py:_hq_refine`):
+- `except Exception: pass` swallowed errores del callback sin log.
+- Fix: `logging.warning()` con candidate index + exception.
+
+**Bug MEDIA — `_PSUTIL_PROC` sin lock** (`api_server.py`):
+- Acceso concurrente desde múltiples workers podía corromper estado interno de psutil
+  → CPU metrics ocasionalmente erráticos.
+- Fix: `threading.Lock()` alrededor de `_PSUTIL_PROC` access.
+
+**Bug MEDIA — `score_history` race condition** (`laser_jobs.py:to_progress_dict`):
+- Slice de lista durante append concurrente (CPython GIL no garantiza atomicidad de
+  list operations).
+- Fix: `list(self.score_history[-N:])` snapshot atómico antes de iterar.
+
+#### Frontend (`web/src/`)
+
+**Bug ALTA — `processingFull` puede quedar `true` tras error async** (`+page.svelte`):
+- Si `backToUpload()` se llamaba con job pendiente, no resetea `processingFull`.
+- Fix: `backToUpload()` ahora resetea TODO el estado + cancela job pendiente.
+
+**Bug ALTA — File input no permite re-subir misma imagen** (`+page.svelte`):
+- `input.value = ''` se ejecutaba al final (después de procesar) en vez del inicio.
+  HTML spec: si el value no cambia, no se dispara `onchange` → usuario tenía que
+  recargar la página para re-subir la misma imagen tras un error.
+- Fix: `input.value = ''` al inicio del handler, antes de procesar.
+
+**Bug ALTA — EventSource sin cleanup en error path** (`apiClient.ts:renderAsync`):
+- `evtSource.onerror` no llamaba `cleanup()` ni cerraba el EventSource → el browser
+  intentaba reconectar automáticamente generando requests fantasma.
+- Fix: cerrar EventSource explícitamente en `onerror`, dejar que polling termine.
+
+**Bug BAJA — `saveMyConfig` swallowed errores silenciosamente** (`apiClient.ts`):
+- Si localStorage estaba deshabilitado (private mode) o quota excedida, el usuario
+  no se enteraba.
+- Fix: `console.warn()` con el error original para debugging.
+
+### UX improvements
+
+**Botón "Descargar PNG ahora" directo en step 4**:
+- Antes obligaba al usuario a navegar a step 5 (página separada) sólo para descargar.
+- Ahora: 2 botones en step 4 — descarga directa rápida + "Ver checklist →" para el
+  paso completo con pre-grabado checklist.
+
+**Botón "Reintentar con la misma imagen" en error de Express**:
+- Antes el usuario tenía que volver al step 1 y re-subir la imagen tras un error.
+- Ahora: error-card con dos botones — "🔄 Reintentar" (mantiene `croppedBlob`) o
+  "Cerrar mensaje".
+
+**Validación temprana del tamaño en frontend**:
+- Antes el usuario subía 200MB y esperaba 30s para que el backend rechazara con 413.
+- Ahora: validación en `onChange` del input con feedback inmediato (< 1s).
+
+### Tests nuevos (3)
+
+- `test_max_upload_size_returns_413` — 101MB rechazado antes de PIL.open.
+- `test_tiny_upload_returns_400` — bytes < 64 rechazados antes de PIL.
+- `test_uniform_image_no_division_by_zero` — autocontrast sobre imagen plana no crashea.
+
+**185 tests totales** (+3 nuevos), todos verdes.
+
+### Documentación nueva
+
+- `docs/CODE_SIGNING.md`: proceso para aplicar a SignPath.io OSS (gratis), workflow
+  GitHub Actions de ejemplo, alternativas (Sectigo OV/EV, winget submission).
+- `README.md`: sección "⚠️ Windows SmartScreen Warning" con 3 opciones de bypass.
+- ZIP portable como alternativa al `.exe` (no dispara SmartScreen).
+
 ## [2.0.0] — 2026-05-16
 
 ### Investigación comparativa contra herramientas comerciales

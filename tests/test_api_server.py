@@ -524,6 +524,62 @@ def test_hq_refine_baseline_preserved_when_no_significant_improvement():
         assert refine_seconds > 0, "el refine debe haber corrido"
 
 
+def test_max_upload_size_returns_413():
+    """v2.1: subir > 100MB debe ser rechazado con 413 sin parsear la imagen."""
+    api = _load_api_app()
+    from fastapi.testclient import TestClient
+    # Generar 101MB de bytes "imagen" inválida (no debe parsear, debe rechazar antes)
+    huge_bytes = b"\xff\xd8\xff\xe0" + (b"x" * (101 * 1024 * 1024))  # JPEG magic + filler
+    with TestClient(api.app) as client:
+        r = client.post(
+            "/api/process",
+            files={"image": ("big.jpg", huge_bytes, "image/jpeg")},
+            data={"params_json": "{}"},
+        )
+        assert r.status_code == 413, f"esperaba 413, got {r.status_code}"
+        detail = r.json()["detail"].lower()
+        assert "grande" in detail or "large" in detail
+
+
+def test_tiny_upload_returns_400():
+    """v2.1: bytes < 64 (claramente no es imagen) debe rechazar antes de PIL.open."""
+    api = _load_api_app()
+    from fastapi.testclient import TestClient
+    with TestClient(api.app) as client:
+        r = client.post(
+            "/api/process",
+            files={"image": ("tiny.jpg", b"abc", "image/jpeg")},
+            data={"params_json": "{}"},
+        )
+        assert r.status_code == 400
+        assert "invalid" in r.json()["detail"].lower()
+
+
+def test_uniform_image_no_division_by_zero():
+    """v2.1: autocontrast sobre imagen uniforme NO debe crashear con NaN/Inf."""
+    api = _load_api_app()
+    from fastapi.testclient import TestClient
+    # Imagen 100% uniforme (gray 128) — antes causaba high-low=0 → división por cero
+    uniform = np.full((128, 128, 3), 128, dtype=np.uint8)
+    buf = io.BytesIO()
+    Image.fromarray(uniform, mode="RGB").save(buf, format="JPEG", quality=95)
+    img_bytes = buf.getvalue()
+    with TestClient(api.app) as client:
+        r = client.post(
+            "/api/process",
+            files={"image": ("uniform.jpg", img_bytes, "image/jpeg")},
+            data={"params_json": json.dumps({
+                "algorithm": "floyd", "autocontrast": 5.0, "quality_mode": "fast", "max_side": 128,
+            })},
+        )
+        assert r.status_code == 200, f"falló: {r.text}"
+        # El output debería ser un PNG válido (no NaN ni todo blanco/negro raro)
+        out = np.array(Image.open(io.BytesIO(r.content)))
+        assert out.size > 0
+        # No debe haber píxeles fuera de [0, 255] (NaN clip)
+        assert out.min() >= 0 and out.max() <= 255
+
+
 def test_auto_mirror_applied_for_back_engrave_material():
     """v2.0: cuando material termina en '_back_engrave', el PNG sale espejado horizontalmente."""
     api = _load_api_app()
